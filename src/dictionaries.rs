@@ -41,9 +41,20 @@ impl ARDictionary {
 
 		ARDictionary {
 			code_list: d.code_list,
-			tau: if d.tau == 0 { 1 } else { d.tau }, // TODO: Calculate tau.
+			tau: if d.tau == 0 { ARDictionary::calculate_tau(d.code_list) } else { d.tau },
 			num_bits: d.num_bits,
 		}
+	}
+
+	fn calculate_tau(code_list: &'static [u64]) -> u8 {
+		let mut tau = 255;
+		for i in 0..code_list.len() {
+			for j in (i+1)..code_list.len() {
+				let dist = hamming_distance(code_list[i], code_list[j]);
+				tau = tau.min(dist);
+			}
+		}
+		return tau;
 	}
 
 	fn new_from_named_dict(code_name: &str) -> Self {
