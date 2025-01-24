@@ -33,7 +33,7 @@ pub static AR_DICTIONARIES: phf::Map<&'static str, ARDictionary> = phf_map! {
 };
 
 impl ARDictionary {
-	fn new_from_ar_dictionary(d: &ARDictionary) -> Self {
+	pub fn new_from_ar_dictionary(d: &ARDictionary) -> Self {
 		let mut code_to_id = HashMap::new();
 		for (i, code) in d.code_list.iter().enumerate() {
 			code_to_id.insert(*code, i);
@@ -57,20 +57,20 @@ impl ARDictionary {
 		return tau;
 	}
 
-	fn new_from_named_dict(code_name: &str) -> Self {
+	pub fn new_from_named_dict(code_name: &str) -> Self {
 		if let Some(d) = AR_DICTIONARIES.get(code_name) {
 			return Self::new_from_ar_dictionary(d);
 		}
 		panic!("TODO: code for this dict is not implemented.")
 	}
 
-	fn get_mark_size(&self) -> u8 {
+	pub fn get_mark_size(&self) -> u8 {
 		(self.num_bits as f32).sqrt().ceil() as u8 + 2
 	}
 
 	/// Search the dictionary for the nearest code (by hamming distance).
 	/// Iterates across all elements in the code list, then returns the ID and the hamming distance
-	fn find_nearest(&self, bits: u64) -> (usize, u8) {
+	pub fn find_nearest(&self, bits: u64) -> (usize, u8) {
 		// The original implementation had this, which seems to do a search for an exact match, but we get that with the min hamming distance, too.
 		/*
 		  var val = '', i, j;
