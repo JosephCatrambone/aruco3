@@ -1,6 +1,5 @@
 mod aruco;
 mod dictionaries;
-mod svd;
 
 pub fn hamming_distance(a: u64, b: u64) -> u8 {
 	let mut flipped_bits = a ^ b;
