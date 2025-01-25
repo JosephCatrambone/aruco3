@@ -22,6 +22,7 @@ pub struct DetectorConfig {
 	pub threshold_window: u32,
 	pub contour_simplification_epsilon: f64,  // Higher gives a more simplified polygon.
 	pub min_side_length_factor: f32, // As a function of image width, what's the minimum size length?  2%? 5%?
+	pub homography_sample_size: usize,
 }
 
 impl Default for DetectorConfig {
@@ -30,6 +31,7 @@ impl Default for DetectorConfig {
 			threshold_window: 7,
 			contour_simplification_epsilon: 0.05,
 			min_side_length_factor: 0.2,
+			homography_sample_size: 49,
 		}
 	}
 }
@@ -47,8 +49,10 @@ impl Detector {
 
 		// Starting in image space, pull convert to greyscale and convert to contours after threshold.
 		//let grey = DynamicImage::ImageRgb8(image).into_luma8();
-		let grey = image.into_luma8();
+		let grey = image.clone().into_luma8();
 		let thresholded = imageproc::contrast::adaptive_threshold(&grey, self.config.threshold_window);
+		#[cfg(debug_assertions)]
+		thresholded.save("DEBUG_thresholded.png");
 		let contours = imageproc::contours::find_contours::<u32>(&thresholded);
 
 		// Now that we're in 'point space', get the candidate edges.
@@ -56,16 +60,36 @@ impl Detector {
 		enforce_clockwise_corners(&mut candidate_polygons);
 		// TODO: Ensure they're not too near.
 
+		// Debug: Draw contours on image.
+		#[cfg(debug_assertions)]
+		{
+			let mut debug_image = image.clone();
+			for (idx, poly) in candidate_polygons.iter().enumerate() {
+				let mut new_poly = vec![];
+				let color = [((idx*29)%255usize) as u8, ((idx*23)%255usize) as u8, ((idx*19)%255usize) as u8, 128];
+				for p in poly.iter() {
+					new_poly.push(Point::new(p.x as i32, p.y as i32));
+				}
+				debug_image = imageproc::drawing::draw_polygon(&image, new_poly.as_slice(), color.into()).into();
+				debug_image.save(format!("DEBUG_detected_polygons_{}.png", idx));
+			}
+		}
+
+		// Convert the candidate polygons to candidate markers.
+		let mut candidate_markers = extract_candidate_markers(&grey, &candidate_polygons, self.config.homography_sample_size as u32);
 
 		Detection {
 			grey: grey,
 			candidates: candidate_polygons,
 			homographies: vec![],
-			markers: vec![],
+			markers: candidate_markers,
 		}
 	}
 
 	fn contours_to_candidates(&self, contours: &Vec<Contour<u32>>, min_edge_length: u32) -> Vec<Vec<Point<u32>>> {
+		let mut stat_reject_point_count = 0;
+		let mut stat_reject_convexity = 0;
+		let mut stat_reject_edge_length = 0;
 		let mut candidate_polygons: Vec<Vec<Point<u32>>> = vec![];
 		for c in contours.into_iter() {
 			// Ramer–Douglas–Peucker algorithm to simplify the polygon.
@@ -74,6 +98,7 @@ impl Detector {
 			// We can't have a quad if it's not four points, convex, with a min edge length above threshold.
 			// Point count:
 			if edges.len() != 4 {
+				stat_reject_point_count += 1;
 				continue;
 			}
 			// Convexity check:
@@ -81,6 +106,7 @@ impl Detector {
 			// We can probably do a faster convexity check manually.
 			edges = imageproc::geometry::convex_hull(edges);
 			if edges.len() != 4 {
+				stat_reject_convexity += 1;
 				continue;
 			}
 			// Length check.
@@ -92,11 +118,14 @@ impl Detector {
 				total_length += ((dx*dx)+(dy*dy)) as u32;
 			}
 			if total_length < min_edge_length {
+				stat_reject_edge_length += 1;
 				continue;
 			}
 
 			candidate_polygons.push(edges);
 		}
+		#[cfg(debug_assertions)]
+		println!("DEBUG:\nRejections point count: {}\nReject convexity: {}\nReject edge length: {}\nFound: {}", stat_reject_point_count, stat_reject_convexity, stat_reject_edge_length, &candidate_polygons.len());
 		candidate_polygons
 	}
 
@@ -120,6 +149,60 @@ fn enforce_clockwise_corners(candidate_polygons: &mut Vec<Vec<Point<u32>>>) {
 			candidate_polygons[i][3] = swap;
 		}
 	}
+}
+
+fn extract_candidate_markers(grey_image: &GrayImage, polygons: &Vec<Vec<Point<u32>>>, homography_size: u32) -> Vec<Marker> {
+	// tl;dr: Pull out homographies from the pile of polygons, but don't call them markers yet.
+	// For each polygon, compute the perspective transform that would be used to make it and then pull it into an image.
+	// The reprojected homographies can have a size larger or smaller than they appear in the image, which can help with decoding.
+
+	// Note: the 'warp' function extracts an image that is the same size as the original, so we pre-crop to the smaller marker area.
+	// We could just apply the warp and then crop after the fact, which might be faster and easier.
+	let mut candidates = vec![];
+
+	polygons.iter().enumerate().for_each(|(polygon_idx, poly)|{
+		// First, find the bounding rectangle for these points.
+		let mut min_x = grey_image.width();
+		let mut max_x = 0u32;
+		let mut min_y = grey_image.height();
+		let mut max_y = 0u32;
+		for pt in poly.iter() {
+			min_x = pt.x.min(min_x);
+			min_y = pt.y.min(min_y);
+			max_x = pt.x.max(max_x);
+			max_y = pt.y.max(max_y);
+		}
+		let cropped_image = image::imageops::crop_imm(grey_image, min_x, min_y, max_x-min_x, max_y-min_y);
+		#[cfg(debug_assertions)]
+		cropped_image.to_image().save(format!("cropped_image_{}.png", polygon_idx)).expect("Save debug cropped image.");
+
+		// Compute the perspective projection for these corners.
+		let topleft = Point::new(min_x, min_y);
+		let p0 = poly[0] - topleft;
+		let p1 = poly[1] - topleft;
+		let p2 = poly[2] - topleft;
+		let p3 = poly[3] - topleft;
+		let h = homography_size as f32; // Convenience
+		let projection = imageproc::geometric_transformations::Projection::from_control_points(
+			[(p0.x as f32, p0.y as f32), (p1.x as f32, p1.y as f32), (p2.x as f32, p2.y as f32), (p3.x as f32, p3.y as f32)],
+			[(0f32, 0f32), (h, 0f32), (h, h), (0f32, h)]
+		);
+
+		// The conversion may fail
+		if let Some(projection) = projection {
+			// Extract homography:
+			let homography = imageproc::geometric_transformations::warp(
+				&cropped_image.to_image(),
+				&projection,
+				imageproc::geometric_transformations::Interpolation::Bicubic,
+				[0u8].into()
+			);
+			#[cfg(debug_assertions)]
+			homography.save(format!("homography_{}.png", polygon_idx));
+		}
+	});
+
+	candidates
 }
 
 #[cfg(test)]
