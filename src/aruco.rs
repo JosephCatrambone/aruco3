@@ -4,9 +4,10 @@ use imageproc::contours::Contour;
 use imageproc::point::Point;
 use crate::dictionaries::ARDictionary;
 
+#[derive(Debug)]
 pub struct Marker {
-	pub id: usize,
-	pub code: u64,
+	pub id: usize,  // The ID and also the index into the dictionary.
+	pub code: u64,  // This is not the code that appears in the dictionary. It's the uncorrected one.
 	pub corners: Vec<(u32, u32)>,
 	pub hamming_distance: u8,
 }
@@ -52,8 +53,8 @@ impl Detector {
 		//let grey = DynamicImage::ImageRgb8(image).into_luma8();
 		let grey = image.clone().into_luma8();
 		let thresholded = imageproc::contrast::adaptive_threshold(&grey, self.config.threshold_window);
-		#[cfg(debug_assertions)]
-		thresholded.save("DEBUG_thresholded.png");
+		//#[cfg(debug_assertions)]
+		//thresholded.save("DEBUG_thresholded.png");
 		let contours = imageproc::contours::find_contours::<u32>(&thresholded);
 
 		// Now that we're in 'point space', get the candidate edges.
@@ -62,6 +63,7 @@ impl Detector {
 		// TODO: Ensure they're not too near.
 
 		// Debug: Draw contours on image.
+		/*
 		#[cfg(debug_assertions)]
 		{
 			let mut debug_image = image.clone();
@@ -75,16 +77,51 @@ impl Detector {
 				debug_image.save(format!("DEBUG_detected_polygons_{}.png", idx));
 			}
 		}
+		*/
 
 		// Use the polygons to extract chunks from the image.
 		let mut homographies = extract_homographies(&grey, &candidate_polygons, self.config.homography_sample_size as u32);
 
+		let mut markers = vec![];
+		for (h, poly) in homographies.iter().zip(&candidate_polygons) {
+			let codes = homography_to_code_permutations(&h, self.dictionary.get_mark_size());
+			let mut found_any: bool = false;
+			let mut min_code_distance: u32 = 0x7FFFFFFF;
+			let mut min_code:u64 = 0x7FFFFFFF;
+			let mut min_code_id:usize = 0x7FFFFFFF;
+			if let Some(codes) = codes {
+				for c in codes {
+					let (nearest_id, nearest_dist) = self.dictionary.find_nearest(c);
+					if (nearest_dist as u32) < min_code_distance {
+						min_code = c;
+						min_code_distance = nearest_dist as u32;
+						min_code_id = nearest_id;
+						found_any = true;
+					}
+				}
+			}
+			if found_any {
+				markers.push(
+					Marker {
+						id: min_code_id,
+						code: min_code,
+						corners: vec![
+							(poly[0].x, poly[0].y),
+							(poly[1].x, poly[1].y),
+							(poly[2].x, poly[2].y),
+							(poly[3].x, poly[3].y),
+						],
+						hamming_distance: min_code_distance as u8
+					}
+				);
+			}
+		}
 
 		Detection {
 			grey: Some(grey),
 			candidates: candidate_polygons,
 			homographies: homographies,
-			markers: candidate_markers,
+			markers: markers,
 		}
 	}
 
@@ -188,7 +225,7 @@ fn extract_homographies(grey_image: &GrayImage, polygons: &Vec<Vec<Point<u32>>>,
 	candidates
 }
 
-fn homography_to_code_permutations(homography: &GrayImage, mark_size: u8) -> Option<(u64, u64, u64, u64)> {
+fn homography_to_code_permutations(homography: &GrayImage, mark_size: u8) -> Option<[u64; 4]> {
 	let otsu_threshold = imageproc::contrast::otsu_level(&homography);
 	let binarized = imageproc::contrast::threshold(&homography, otsu_threshold, imageproc::contrast::ThresholdType::Binary);
 
@@ -199,19 +236,58 @@ fn homography_to_code_permutations(homography: &GrayImage, mark_size: u8) -> Opt
 
 	// JC Note: Couldn't we just resize the whole thing to the mark size and threshold?
 	let reduced = image::imageops::resize(&binarized, mark_size as u32, mark_size as u32, image::imageops::FilterType::Triangle);
-
-	// Iterate around the perimeter.  If there are any pixels above 127 then it's not a real marker.
-	for i in 0..mark_size {
-		if (
-			reduced.get_pixel(i as u32, 0)[0] > 127 ||
-			reduced.get_pixel(i as u32, (mark_size-1) as u32)[0] > 127 ||
-			reduced.get_pixel(0, i as u32)[0] > 127 ||
-			reduced.get_pixel( (mark_size-1) as u32, i as u32)[0] > 127
-		) {
-			return None;
+	let mut bit_array = vec![];
+	let mut bit_subarray = vec![];
+	for (x, y, p) in reduced.enumerate_pixels() {
+		if x == 0 {
+			if !bit_subarray.is_empty() {
+				bit_array.push(bit_subarray);
+				bit_subarray = vec![];
+			}
 		}
+		bit_subarray.push(p[0] > 127);
 	}
-	todo!()
+	bit_array.push(bit_subarray);
+
+	// Iterate around the perimeter.  If there are any white spots then it's not a marker.
+	let mark_end_idx = mark_size.saturating_sub(1) as usize;
+	for i in 0..mark_size {
+		if bit_array[i as usize][0] || bit_array[i as usize][mark_end_idx] { return None; }
+		if bit_array[0][i as usize] || bit_array[mark_end_idx][i as usize] { return None; }
+	}
+
+	// Read the inner marker to decode it, then rotate it so we can read more bits.
+	// TODO: There must be a more efficient way to store and rotate these pixels.
+	let mut results = [0u64, 0u64, 0u64, 0u64];
+	for i in 0..4 {
+		let mut bits = 0u64;
+		for y in 1..mark_size-1 {
+			for x in 1..mark_size-1 {
+				if bit_array[y as usize][x as usize] {
+					bits |= 1;
+				}
+				bits = bits.rotate_left(1); // Rotate preserves the last bit so we can unrotate from the extra step.
+			}
+		}
+		bits = bits.rotate_right(1); // One extra.
+		results[i] = bits;
+		bit_array = rotate_bit_matrix(&bit_array); // There must be a more elegant way to do this.
+	}
+
+	Some(results)
+}
+
+fn rotate_bit_matrix(bit_matrix: &Vec<Vec<bool>>) -> Vec<Vec<bool>> {
+	// Returns a new vec of vec of bits rotated 90 degrees counter clockwise.
+	let mut new_bitset = vec![];
+	for x in (0..bit_matrix[0].len()).rev() {
+		let mut subset = vec![];
+		for y in 0..bit_matrix.len() {
+			subset.push(bit_matrix[y][x]);
+		}
+		new_bitset.push(subset);
+	}
+	new_bitset
 }
 
 #[cfg(test)]
@@ -236,6 +312,9 @@ mod tests {
 			let path = entry.path();
 			let test_image: DynamicImage = image::open(path).unwrap();
 			let detection = detector.detect(test_image);
+			for m in detection.markers.iter() {
+				dbg!(m);
+			}
 		}
 		//dbg!(detection.candidates);
 		//assert_eq!(dist, 1);
@@ -253,5 +332,22 @@ mod tests {
 		enforce_clockwise_corners(&mut corners);
 		assert_eq!(&corners[0], &corners[1]);
 		dbg!(corners);
+	}
+
+	#[test]
+	fn test_bit_rotate() {
+		let preimage = vec![
+			vec![true, true, true],
+			vec![true, false, false],
+			vec![false, true, false]
+		];
+		let postimage = vec![
+			vec![true, false, false],
+			vec![true, false, true],
+			vec![true, true, false],
+		];
+
+		let rot = rotate_bit_matrix(&preimage);
+		assert_eq!(rot, postimage);
 	}
 }
