@@ -51,7 +51,7 @@ impl Detector {
 
 		// Starting in image space, pull convert to greyscale and convert to contours after threshold.
 		//let grey = DynamicImage::ImageRgb8(image).into_luma8();
-		let grey = image.clone().into_luma8();
+		let grey = image.into_luma8();
 		let thresholded = imageproc::contrast::adaptive_threshold(&grey, self.config.threshold_window);
 		//#[cfg(debug_assertions)]
 		//thresholded.save("DEBUG_thresholded.png");
@@ -61,23 +61,6 @@ impl Detector {
 		let mut candidate_polygons = contours_to_candidates(&contours, min_edge_length, self.config.contour_simplification_epsilon);
 		enforce_clockwise_corners(&mut candidate_polygons);
 		// TODO: Ensure they're not too near.
-
-		// Debug: Draw contours on image.
-		/*
-		#[cfg(debug_assertions)]
-		{
-			let mut debug_image = image.clone();
-			for (idx, poly) in candidate_polygons.iter().enumerate() {
-				let mut new_poly = vec![];
-				let color = [((idx*29)%255usize) as u8, ((idx*23)%255usize) as u8, ((idx*19)%255usize) as u8, 128];
-				for p in poly.iter() {
-					new_poly.push(Point::new(p.x as i32, p.y as i32));
-				}
-				debug_image = imageproc::drawing::draw_polygon(&image, new_poly.as_slice(), color.into()).into();
-				debug_image.save(format!("DEBUG_detected_polygons_{}.png", idx));
-			}
-		}
-		*/
 
 		// Use the polygons to extract chunks from the image.
 		let mut homographies = extract_homographies(&grey, &candidate_polygons, self.config.homography_sample_size as u32);
@@ -117,13 +100,24 @@ impl Detector {
 			}
 		}
 
-		Detection {
+		#[cfg(debug_assertions)]
+		return Detection {
 			grey: Some(grey),
 			candidates: candidate_polygons,
 			homographies: homographies,
 			markers: markers,
-		}
+		};
+		// TODO: Do we want to have a separate path for non-debug where we keep the grey image?
+		#[cfg(not(debug_assertions))]
+		return Detection {
+			grey: None,
+			candidates: vec![],
+			homographies: vec![],
+			markers
+		};
 	}
+
+	// TODO: Pose detection here.
 
 }
 
@@ -296,6 +290,7 @@ mod tests {
 	use std::fs::read_dir;
 
 	use image;
+	use imageproc;
 	use crate::dictionaries::ARDictionary;
 	use super::*;
 
@@ -307,14 +302,25 @@ mod tests {
 		};
 
 		let asset_path = Path::new("assets");
-		for entry in read_dir(&asset_path).unwrap() {
+		for (idx, entry) in read_dir(&asset_path).unwrap().enumerate() {
 			let entry = entry.unwrap();
 			let path = entry.path();
 			let test_image: DynamicImage = image::open(path).unwrap();
-			let detection = detector.detect(test_image);
+			let detection = detector.detect(test_image.clone());
+			let mut debug_image = test_image.clone().into_rgba8();
 			for m in detection.markers.iter() {
 				dbg!(m);
+				for p_idx in 0..m.corners.len() {
+					debug_image = imageproc::drawing::draw_line_segment(
+						&debug_image,
+						(m.corners[p_idx].0 as f32, m.corners[p_idx].1 as f32),
+						(m.corners[(p_idx+1)%4].0 as f32, m.corners[(p_idx+1)%4].1 as f32),
+						[255, 0, 255, 250].into()
+					)
+				}
 			}
+			//debug_image = imageproc::drawing::draw_polygon(&debug_image, new_poly.as_slice(), color.into()).into();
+			debug_image.save(format!("DEBUG_detected_polygons_{}.png", idx));
 		}
 		//dbg!(detection.candidates);
 		//assert_eq!(dist, 1);
