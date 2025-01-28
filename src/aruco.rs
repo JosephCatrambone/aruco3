@@ -72,28 +72,32 @@ impl Detector {
 			let mut min_code_distance: u32 = 0x7FFFFFFF;
 			let mut min_code:u64 = 0x7FFFFFFF;
 			let mut min_code_id:usize = 0x7FFFFFFF;
+			let mut min_rotation = 0;
 			if let Some(codes) = codes {
-				for c in codes {
+				for (rotation_idx, c) in codes.into_iter().enumerate() {
 					let (nearest_id, nearest_dist) = self.dictionary.find_nearest(c);
 					if (nearest_dist as u32) < min_code_distance {
 						min_code = c;
 						min_code_distance = nearest_dist as u32;
 						min_code_id = nearest_id;
+						min_rotation = rotation_idx;
 						found_any = true;
 					}
 				}
 			}
 			if found_any {
+				let mut corners = vec![
+					(poly[0].x, poly[0].y),
+					(poly[1].x, poly[1].y),
+					(poly[2].x, poly[2].y),
+					(poly[3].x, poly[3].y),
+				];
+				corners.rotate_left(min_rotation);
 				markers.push(
 					Marker {
 						id: min_code_id,
 						code: min_code,
-						corners: vec![
-							(poly[0].x, poly[0].y),
-							(poly[1].x, poly[1].y),
-							(poly[2].x, poly[2].y),
-							(poly[3].x, poly[3].y),
-						],
+						corners: corners,
 						hamming_distance: min_code_distance as u8
 					}
 				);
@@ -116,9 +120,6 @@ impl Detector {
 			markers
 		};
 	}
-
-	// TODO: Pose detection here.
-
 }
 
 fn contours_to_candidates(contours: &Vec<Contour<u32>>, min_edge_length: u32, contour_simplification_epsilon: f64) -> Vec<Vec<Point<u32>>> {
@@ -289,6 +290,7 @@ mod tests {
 	use std::path::Path;
 	use std::fs::read_dir;
 
+	use ab_glyph::{PxScale, FontRef};
 	use image;
 	use imageproc;
 	use crate::dictionaries::ARDictionary;
@@ -296,6 +298,7 @@ mod tests {
 
 	#[test]
 	fn test_find_marker() {
+		let font: FontRef = FontRef::try_from_slice(include_bytes!("../assets/DejaVuSans.ttf")).expect("Couldn't load packed font.");
 		let detector = Detector {
 			config: DetectorConfig::default(),
 			dictionary: ARDictionary::new_from_named_dict("ARUCO_DEFAULT"),
@@ -305,14 +308,21 @@ mod tests {
 		for (idx, entry) in read_dir(&asset_path).unwrap().enumerate() {
 			let entry = entry.unwrap();
 			let path = entry.path();
-			let test_image: DynamicImage = image::open(path).unwrap();
+			let test_image: Result<DynamicImage, image::ImageError> = image::open(path);
+			if test_image.is_err() {
+				continue;
+			}
+			let test_image: DynamicImage = test_image.unwrap();
 			let detection = detector.detect(test_image.clone());
 			let mut debug_image = test_image.clone().into_rgba8();
 			for m in detection.markers.iter() {
 				dbg!(m);
+				imageproc::drawing::draw_cross_mut(&mut debug_image, [0, 0, 255, 255].into(), m.corners[0].0 as i32, m.corners[0].1 as i32);
+				imageproc::drawing::draw_text_mut(&mut debug_image, [0, 0, 0, 255].into(), m.corners[0].0 as i32-1, m.corners[0].1 as i32-1, 32f32, &font, &format!("{}: {}", &m.id, &m.code));
+				imageproc::drawing::draw_text_mut(&mut debug_image, [255, 255, 255, 255].into(), m.corners[0].0 as i32, m.corners[0].1 as i32, 32f32, &font, &format!("{}: {}", &m.id, &m.code));
 				for p_idx in 0..m.corners.len() {
-					debug_image = imageproc::drawing::draw_line_segment(
-						&debug_image,
+					imageproc::drawing::draw_line_segment_mut(
+						&mut debug_image,
 						(m.corners[p_idx].0 as f32, m.corners[p_idx].1 as f32),
 						(m.corners[(p_idx+1)%4].0 as f32, m.corners[(p_idx+1)%4].1 as f32),
 						[255, 0, 255, 250].into()
@@ -320,7 +330,7 @@ mod tests {
 				}
 			}
 			//debug_image = imageproc::drawing::draw_polygon(&debug_image, new_poly.as_slice(), color.into()).into();
-			debug_image.save(format!("DEBUG_detected_polygons_{}.png", idx));
+			debug_image.save(format!("DEBUG_detected_polygons_{}.png", idx)).expect("Save debug image failed.");
 		}
 		//dbg!(detection.candidates);
 		//assert_eq!(dist, 1);

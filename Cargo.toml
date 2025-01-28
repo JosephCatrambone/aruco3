@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ab_glyph = "*"
 phf = { version = "0.11", default-features = false, features = ["macros"] }
 nalgebra = { version = "0.33", features = [] }
 image = { version = "0.25", features = [] }

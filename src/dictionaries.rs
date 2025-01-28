@@ -89,13 +89,15 @@ impl ARDictionary {
 		*/
 		// Build a default if we happen to not find anything.
 		//let mut min_id: usize = 0;
+		let mut found = false;
 		let mut min_index: usize = 0;
 		let mut min_code: u64 = 0;
 		let mut min_distance: u8 = 0xFFu8;
 
 		for (idx, c) in self.code_list.iter().enumerate() {
 			let dist = hamming_distance(*c, bits);
-			if dist < min_distance && dist < self.tau {
+			if dist < min_distance {
+				found = true;
 				min_distance = dist;
 				min_index = idx;
 				min_code = *c;
@@ -105,11 +107,28 @@ impl ARDictionary {
 
 		(min_index, min_distance)
 	}
+
+	/// Search the dictionary for the nearest matching code and return Some(id, dist) if found AND dist is less than tau.
+	/// This will return None if the nearest distance is greater than the error bars for the code set.
+ 	pub fn try_find_nearest(&self, bits: u64) -> Option<(usize, u8)> {
+ 		let (id, dist) = self.find_nearest(bits);
+ 		if dist < self.tau {
+ 			return Some((id, dist));
+ 		} else {
+ 			return None;
+ 		}
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_tau_sanity() {
+		let d = ARDictionary::new_from_named_dict("ARUCO_DEFAULT");
+		assert_eq!(d.tau, 3);
+	}
 
 	#[test]
 	fn test_find_nearest_aruco_default() {
@@ -131,5 +150,21 @@ mod tests {
 		(nearest_idx, dist) = d.find_nearest(0b00000001_00001000_01000010_10001001);
 		assert_eq!(nearest_idx, 2);
 		assert_eq!(dist, 1);
+
+		(nearest_idx, dist) = d.find_nearest(0x1084217);
+		assert_eq!(nearest_idx, 1);
+		assert_eq!(dist, 0);
+	}
+
+	#[test]
+	fn test_try_find_nearest_aruco_default() {
+		let d = ARDictionary::new_from_named_dict("ARUCO_DEFAULT");
+		// let maybe_match = d.try_find_nearest(0b00000001_00001000_01000010_00001001);
+		let maybe_match = d.try_find_nearest(0b01100001_00001000_01000010_00001001);
+		assert!(maybe_match.is_some());
+		assert_eq!(maybe_match.unwrap().0, 2);
+
+		let maybe_match = d.try_find_nearest(0b11111111_0000100_01000010_00001001);
+		assert!(maybe_match.is_none());
 	}
 }
