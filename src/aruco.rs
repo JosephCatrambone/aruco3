@@ -23,6 +23,7 @@ pub struct DetectorConfig {
 	pub threshold_window: u32,
 	pub contour_simplification_epsilon: f64,  // Lower number gives a more simplified polygon.
 	pub min_side_length_factor: f32, // As a function of image width, what's the minimum size length?  2%? 5%?
+	pub min_corner_separation: f32, // What's the minimum distance by which all corners need to be separated for a detection?
 	pub homography_sample_size: usize, // We extract and map the homography to an image of this width and height.  Make sure this is big enough to include all the points in the binary code.
 }
 
@@ -32,6 +33,7 @@ impl Default for DetectorConfig {
 			threshold_window: 7,
 			contour_simplification_epsilon: 0.05,
 			min_side_length_factor: 0.2,
+			min_corner_separation: 10f32,
 			homography_sample_size: 49,
 		}
 	}
@@ -60,7 +62,7 @@ impl Detector {
 		// Now that we're in 'point space', get the candidate edges.
 		let mut candidate_polygons = contours_to_candidates(&contours, min_edge_length, self.config.contour_simplification_epsilon);
 		enforce_clockwise_corners(&mut candidate_polygons);
-		// TODO: Ensure they're not too near.
+		discard_too_near(&mut candidate_polygons, self.config.min_corner_separation);
 
 		// Use the polygons to extract chunks from the image.
 		let mut homographies = extract_homographies(&grey, &candidate_polygons, self.config.homography_sample_size as u32);
@@ -85,6 +87,8 @@ impl Detector {
 					}
 				}
 			}
+			// NOTE: the filter on dist < tau is a HUGE filter.
+			// If we omit that we get far, far more results.
 			if found_any {
 				let mut corners = vec![
 					(poly[0].x, poly[0].y),
@@ -182,6 +186,39 @@ fn enforce_clockwise_corners(candidate_polygons: &mut Vec<Vec<Point<u32>>>) {
 			candidate_polygons[i][1] = candidate_polygons[i][3];
 			candidate_polygons[i][3] = swap;
 		}
+	}
+}
+
+fn discard_too_near(candidate_polygons: &mut Vec<Vec<Point<u32>>>, min_distance: f32) {
+	// If the mean (unaligned/uncorrected) distance between each pair of points is less than min_distance, pick the polygon with the bigger perimeter.
+	// NOTE: This doesn't work if one of the polygons is rotated.
+	// TODO: Handle polygon rotation case.
+
+	let mut index_to_drop = vec![];
+	
+	for i in 0..candidate_polygons.len() {
+		let perimeter_i = perimeter(&candidate_polygons[i]);
+		let mut distance = 1e31f32;
+		for j in (i+1)..candidate_polygons.len() {
+			for p_idx in 0..4 {
+				let dx = candidate_polygons[i][p_idx].x as f32 - candidate_polygons[j][p_idx].x as f32;
+				let dy = candidate_polygons[i][p_idx].y as f32 - candidate_polygons[j][p_idx].y as f32;
+				distance += (dx*dx)+(dy*dy);
+			}
+			if (distance/4.0f32) < (min_distance * min_distance) {
+				let perimeter_j = perimeter(&candidate_polygons[j]);
+				if perimeter_i > perimeter_j {
+					index_to_drop.push(j);
+				} else {
+					index_to_drop.push(i);
+				}
+			}
+		}
+	}
+
+	index_to_drop.sort();
+	for to_drop in index_to_drop.into_iter().rev() {
+		candidate_polygons.remove(to_drop);
 	}
 }
 
@@ -285,6 +322,18 @@ fn rotate_bit_matrix(bit_matrix: &Vec<Vec<bool>>) -> Vec<Vec<bool>> {
 	new_bitset
 }
 
+fn perimeter(polygon: &Vec<Point<u32>>) -> f32 {
+	let mut p = 0.0f32;
+
+	for i in 0..polygon.len() {
+		let dx = polygon[i].x as f32 - polygon[(i+1)%polygon.len()].x as f32;
+		let dy = polygon[i].y as f32 - polygon[(i+1)%polygon.len()].y as f32;
+		p += ((dx*dx)+(dy*dy)).sqrt();
+	}
+
+	p
+}
+
 #[cfg(test)]
 mod tests {
 	use std::path::Path;
@@ -316,18 +365,20 @@ mod tests {
 			let detection = detector.detect(test_image.clone());
 			let mut debug_image = test_image.clone().into_rgba8();
 			for m in detection.markers.iter() {
+				if m.hamming_distance > detector.dictionary.tau { continue; }
 				dbg!(m);
-				imageproc::drawing::draw_cross_mut(&mut debug_image, [0, 0, 255, 255].into(), m.corners[0].0 as i32, m.corners[0].1 as i32);
-				imageproc::drawing::draw_text_mut(&mut debug_image, [0, 0, 0, 255].into(), m.corners[0].0 as i32-1, m.corners[0].1 as i32-1, 32f32, &font, &format!("{}: {}", &m.id, &m.code));
-				imageproc::drawing::draw_text_mut(&mut debug_image, [255, 255, 255, 255].into(), m.corners[0].0 as i32, m.corners[0].1 as i32, 32f32, &font, &format!("{}: {}", &m.id, &m.code));
 				for p_idx in 0..m.corners.len() {
 					imageproc::drawing::draw_line_segment_mut(
 						&mut debug_image,
 						(m.corners[p_idx].0 as f32, m.corners[p_idx].1 as f32),
 						(m.corners[(p_idx+1)%4].0 as f32, m.corners[(p_idx+1)%4].1 as f32),
-						[255, 0, 255, 250].into()
+						[255, 0, 0, 255].into()
 					)
 				}
+				imageproc::drawing::draw_cross_mut(&mut debug_image, [0, 0, 255, 255].into(), m.corners[0].0 as i32, m.corners[0].1 as i32);
+				let marker_text = format!("{}: {}", &m.id, &m.hamming_distance);
+				imageproc::drawing::draw_text_mut(&mut debug_image, [0, 0, 0, 255].into(), m.corners[0].0 as i32-1, m.corners[0].1 as i32-1, 32f32, &font, &marker_text);
+				imageproc::drawing::draw_text_mut(&mut debug_image, [255, 0, 255, 255].into(), m.corners[0].0 as i32, m.corners[0].1 as i32, 32f32, &font, &marker_text);
 			}
 			//debug_image = imageproc::drawing::draw_polygon(&debug_image, new_poly.as_slice(), color.into()).into();
 			debug_image.save(format!("DEBUG_detected_polygons_{}.png", idx)).expect("Save debug image failed.");
