@@ -1,4 +1,4 @@
-
+use std::collections::HashSet;
 use image::{DynamicImage, GenericImageView, GrayImage};
 use imageproc::contours::Contour;
 use imageproc::point::Point;
@@ -23,8 +23,9 @@ pub struct DetectorConfig {
 	pub threshold_window: u32,
 	pub contour_simplification_epsilon: f64,  // Lower number gives a more simplified polygon.
 	pub min_side_length_factor: f32, // As a function of image width, what's the minimum size length?  2%? 5%?
-	pub min_corner_separation: f32, // What's the minimum distance by which all corners need to be separated for a detection?
+	pub min_corner_separation_factor: f32, // What's the minimum distance (as a fraction of image size) by which all corners need to be separated for a detection?
 	pub homography_sample_size: usize, // We extract and map the homography to an image of this width and height.  Make sure this is big enough to include all the points in the binary code.
+	pub filter_high_bit_errors: bool, // Should we filter detections whose bit errors exceed tau? If false, will give lots of detections, but probably bad decodes.
 }
 
 impl Default for DetectorConfig {
@@ -33,8 +34,9 @@ impl Default for DetectorConfig {
 			threshold_window: 7,
 			contour_simplification_epsilon: 0.05,
 			min_side_length_factor: 0.2,
-			min_corner_separation: 10f32,
+			min_corner_separation_factor: 0.1f32,
 			homography_sample_size: 49,
+			filter_high_bit_errors: true,
 		}
 	}
 }
@@ -50,6 +52,7 @@ impl Detector {
 		let image_width = image.width();
 		let image_height = image.height();
 		let min_edge_length = (image_width.min(image_height) as f32 * self.config.min_side_length_factor) as u32;
+		let min_corner_separation = image_width.min(image_height) as f32 * self.config.min_corner_separation_factor;
 
 		// Starting in image space, pull convert to greyscale and convert to contours after threshold.
 		//let grey = DynamicImage::ImageRgb8(image).into_luma8();
@@ -62,7 +65,7 @@ impl Detector {
 		// Now that we're in 'point space', get the candidate edges.
 		let mut candidate_polygons = contours_to_candidates(&contours, min_edge_length, self.config.contour_simplification_epsilon);
 		enforce_clockwise_corners(&mut candidate_polygons);
-		discard_too_near(&mut candidate_polygons, self.config.min_corner_separation);
+		discard_too_near(&mut candidate_polygons, min_corner_separation);
 
 		// Use the polygons to extract chunks from the image.
 		let mut homographies = extract_homographies(&grey, &candidate_polygons, self.config.homography_sample_size as u32);
@@ -89,7 +92,7 @@ impl Detector {
 			}
 			// NOTE: the filter on dist < tau is a HUGE filter.
 			// If we omit that we get far, far more results.
-			if found_any {
+			if found_any && (!self.config.filter_high_bit_errors || min_code_distance < self.dictionary.tau as u32) {
 				let mut corners = vec![
 					(poly[0].x, poly[0].y),
 					(poly[1].x, poly[1].y),
@@ -108,21 +111,12 @@ impl Detector {
 			}
 		}
 
-		#[cfg(debug_assertions)]
-		return Detection {
+		Detection {
 			grey: Some(grey),
 			candidates: candidate_polygons,
 			homographies: homographies,
 			markers: markers,
-		};
-		// TODO: Do we want to have a separate path for non-debug where we keep the grey image?
-		#[cfg(not(debug_assertions))]
-		return Detection {
-			grey: None,
-			candidates: vec![],
-			homographies: vec![],
-			markers
-		};
+		}
 	}
 }
 
@@ -194,30 +188,35 @@ fn discard_too_near(candidate_polygons: &mut Vec<Vec<Point<u32>>>, min_distance:
 	// NOTE: This doesn't work if one of the polygons is rotated.
 	// TODO: Handle polygon rotation case.
 
-	let mut index_to_drop = vec![];
-	
-	for i in 0..candidate_polygons.len() {
+	let mut dead_set = HashSet::new();
+	let mut indices_to_drop = vec![];
+
+	for i in 0..(candidate_polygons.len()-1) {
+		if dead_set.contains(&i) { continue; }
 		let perimeter_i = perimeter(&candidate_polygons[i]);
-		let mut distance = 1e31f32;
 		for j in (i+1)..candidate_polygons.len() {
+			if dead_set.contains(&j) { continue; }
+			let mut distance = 0f32;
 			for p_idx in 0..4 {
 				let dx = candidate_polygons[i][p_idx].x as f32 - candidate_polygons[j][p_idx].x as f32;
 				let dy = candidate_polygons[i][p_idx].y as f32 - candidate_polygons[j][p_idx].y as f32;
-				distance += (dx*dx)+(dy*dy);
+				distance += ((dx*dx)+(dy*dy)).sqrt();
 			}
-			if (distance/4.0f32) < (min_distance * min_distance) {
+			if (distance/4.0f32) < min_distance {
 				let perimeter_j = perimeter(&candidate_polygons[j]);
-				if perimeter_i > perimeter_j {
-					index_to_drop.push(j);
+				if perimeter_i >= perimeter_j {
+					dead_set.insert(j.clone());
+					indices_to_drop.push(j);
 				} else {
-					index_to_drop.push(i);
+					dead_set.insert(i.clone());
+					indices_to_drop.push(i);
 				}
 			}
 		}
 	}
 
-	index_to_drop.sort();
-	for to_drop in index_to_drop.into_iter().rev() {
+	indices_to_drop.sort();
+	for to_drop in indices_to_drop.into_iter().rev() {
 		candidate_polygons.remove(to_drop);
 	}
 }
@@ -349,6 +348,12 @@ mod tests {
 	fn test_find_marker() {
 		let font: FontRef = FontRef::try_from_slice(include_bytes!("../assets/DejaVuSans.ttf")).expect("Couldn't load packed font.");
 		let detector = Detector {
+			/*
+			config: DetectorConfig {
+				filter_high_bit_errors: false,
+				.. DetectorConfig::default()
+			},
+			*/
 			config: DetectorConfig::default(),
 			dictionary: ARDictionary::new_from_named_dict("ARUCO_DEFAULT"),
 		};
@@ -365,7 +370,6 @@ mod tests {
 			let detection = detector.detect(test_image.clone());
 			let mut debug_image = test_image.clone().into_rgba8();
 			for m in detection.markers.iter() {
-				if m.hamming_distance > detector.dictionary.tau { continue; }
 				dbg!(m);
 				for p_idx in 0..m.corners.len() {
 					imageproc::drawing::draw_line_segment_mut(
@@ -416,5 +420,35 @@ mod tests {
 
 		let rot = rotate_bit_matrix(&preimage);
 		assert_eq!(rot, postimage);
+
+		let preimage = vec![
+			vec![true, true, true, true],
+			vec![true, true, true, false],
+			vec![true, true, false, false],
+			vec![true, false, false, false],
+		];
+		let postimage = vec![
+			vec![true, false, false, false],
+			vec![true, true, false, false],
+			vec![true, true, true, false],
+			vec![true, true, true, true],
+		];
+		let rot = rotate_bit_matrix(&preimage);
+		assert_eq!(rot, postimage);
+	}
+
+	#[test]
+	fn test_drop_too_near() {
+		let mut pts = vec![
+			vec![Point::new(0, 0), Point::new(10, 0), Point::new(10, 10), Point::new(0, 10)],
+			vec![Point::new(1, 0), Point::new(10, 0), Point::new(10, 10), Point::new(0, 10)],
+			vec![Point::new(0, 0), Point::new(10, 2), Point::new(10, 10), Point::new(0, 10)],
+			vec![Point::new(0, 0), Point::new(10, 0), Point::new(10, 10), Point::new(3, 10)],
+		];
+
+		println!("Points before: {}", &pts.len());
+		discard_too_near(&mut pts, 10.0f32);
+		println!("Points after: {}", &pts.len());
+		assert_eq!(pts.len(), 1);
 	}
 }
