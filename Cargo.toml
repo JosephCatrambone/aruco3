@@ -18,3 +18,7 @@ rand = "0.9"
 [[bench]]
 name = "detect_markers"
 harness = false
+
+# For flamegraph --bench detect_markers
+#[profile.bench]
+#debug=true
