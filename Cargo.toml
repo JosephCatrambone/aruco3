@@ -4,8 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ab_glyph = "*"
-phf = { version = "0.11", default-features = false, features = ["macros"] }
-nalgebra = { version = "0.33", features = [] }
 image = { version = "0.25", features = [] }
 imageproc = { version = "0.25", features = [] }
+nalgebra = { version = "0.33", features = [] }
+phf = { version = "0.11", default-features = false, features = ["macros"] }
+rayon = { version = "1.10" }
+
+[dev-dependencies]
+ab_glyph = "*"
+divan = "0.1.17"
+rand = "0.9"
+
+[[bench]]
+name = "detect_markers"
+harness = false

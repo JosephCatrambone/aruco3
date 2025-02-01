@@ -2,6 +2,9 @@ mod aruco;
 mod dictionaries;
 mod pose;
 
+pub use aruco::{Detector, DetectorConfig, Detection, Marker};
+pub use dictionaries::ARDictionary;
+
 pub fn hamming_distance(a: u64, b: u64) -> u8 {
 	let mut flipped_bits = a ^ b;
 	let mut flip_count = 0u8;

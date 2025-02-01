@@ -42,9 +42,9 @@ impl Default for DetectorConfig {
 }
 
 
-struct Detector {
-	config: DetectorConfig,
-	dictionary: ARDictionary,
+pub struct Detector {
+	pub config: DetectorConfig,
+	pub dictionary: ARDictionary,
 }
 
 impl Detector {
