@@ -226,7 +226,6 @@ fn extract_homographies(grey_image: &GrayImage, polygons: &Vec<Vec<Point<u32>>>,
 	// For each polygon, compute the perspective transform that would be used to make it and then pull it into an image.
 	// The reprojected homographies can have a size larger or smaller than they appear in the image, which can help with decoding.
 
-	// Note: We tried pre-cropping around the image, but it didn't actually save compute and made things more complicated, so we crop afterward.
 	let mut candidates = vec![];
 
 	polygons.iter().enumerate().for_each(|(polygon_idx, poly)|{
@@ -240,14 +239,9 @@ fn extract_homographies(grey_image: &GrayImage, polygons: &Vec<Vec<Point<u32>>>,
 		// The conversion may fail, and if it does add an empty homography.  We could optimize a bit with result types...
 		if let Some(projection) = projection {
 			// Extract homography:
-			let mut homography = imageproc::geometric_transformations::warp(
-				grey_image,
-				&projection,
-				imageproc::geometric_transformations::Interpolation::Bicubic,
-				[0u8].into()
-			);
-			let cropped_homography = image::imageops::crop(&mut homography, 0, 0, homography_size, homography_size).to_image();
-			candidates.push(cropped_homography);
+			let mut homography = image::GrayImage::new(homography_size, homography_size);
+			imageproc::geometric_transformations::warp_into(grey_image, &projection, imageproc::geometric_transformations::Interpolation::Bilinear, [0u8].into(), &mut homography);
+			candidates.push(homography);
 		} else {
 			candidates.push(GrayImage::new(1, 1));
 		}
