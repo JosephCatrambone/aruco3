@@ -11,9 +11,13 @@ phf = { version = "0.11", default-features = false, features = ["macros"] }
 rayon = { version = "1.10" }
 
 [dev-dependencies]
+# For benchmarking and debugging:
 ab_glyph = "*"
 divan = "0.1.17"
 rand = "0.9"
+# For the webcam demo:
+minifb = "0.28"
+nokhwa = { version = "0.10.7", features = ["input-native", "output-threaded"] }
 
 [[bench]]
 name = "detect_markers"
