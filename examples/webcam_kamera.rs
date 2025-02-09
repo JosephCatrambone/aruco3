@@ -57,10 +57,8 @@ fn main() {
 		let end_detection = Instant::now();
 		println!("Detection took {:?} for {} markers.", (end_detection - start_detection), detections.markers.len());
 		for d in detections.markers.iter() {
-			for (x, y) in &d.corners {
-				if let Some(pixel) = window_buffer.get_mut((x + (y*w)) as usize) {
-					*pixel = 0xFFFF00FF;
-				}
+			for i in 0..4 {
+				lazy_line(&d.corners[i], &d.corners[(i+1)%4], 0xFFFF00FF, &mut window_buffer, w, h);
 			}
 		}
 
@@ -72,4 +70,24 @@ fn main() {
 	//img.save("test.png").expect("Saved PNG.");
 
 	camera.stop() // or drop it
+}
+
+fn lazy_line(start: &(u32, u32), end: &(u32, u32), color: u32, buffer: &mut Vec<u32>, buffer_width: u32, buffer_height: u32) {
+	// This is dumb and almost certainly slower than bresnehan's algorithm, but it's simple.
+	let mut dx = end.0 as f32 - start.0 as f32;
+	let mut dy = end.1 as f32 - start.1 as f32;
+	let steps = (dx*dx + dy*dy).sqrt().ceil().max(1.0f32);
+	let mut px = start.0 as f32;
+	let mut py = start.1 as f32;
+	dx /= steps;
+	dy /= steps;
+	for _ in 0..(steps as u32) {
+		if px < 0f32 || py < 0f32 || px > buffer_width as f32 || py > buffer_height as f32 { continue; } // Since the corner detections _have_ to be inside the image this should be safe, but...
+		let idx = px as u32 + (py as u32 * buffer_width);
+		if let Some(pixel) = buffer.get_mut(idx as usize) {
+			*pixel = color;
+		}
+		px += dx;
+		py += dy;
+	}
 }
