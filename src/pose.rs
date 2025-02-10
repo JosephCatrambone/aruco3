@@ -45,23 +45,30 @@ impl PoseEstimator {
 			original_frame[3].x - original_frame[0].x, original_frame[3].y - original_frame[0].y, original_frame[3].z - original_frame[0].z,
 		);
 
+		let pseudoinverse = model_vectors.pseudo_inverse(INITIAL_SVD_EPSILON).expect("Failed to compute initial pseudoinverse of model vectors. Is the focal distance real? Is the marker size nonzero?");
 		// Double check this:
-		// Do we want to use try_new?  Should we use the built-in pseudoinverse?
-		/*
-		let svd: na::linalg::SVD<f32, na::U3, na::U3> = na::linalg::SVD::new(model_vectors, true, true);
+		let svd: na::linalg::SVD<f32, na::U3, na::U3> = na::linalg::SVD::try_new(model_vectors, true, true, INITIAL_SVD_EPSILON, INITIAL_SVD_MAX_ITER).expect("Failed to compute initial decomposition for marker and vector. This can happen if marker size or focal length is zero.");
 		let v_t = svd.v_t.unwrap();
+		/*
+		// Ideally since we're computing the SVD once we should just multiply it back out to get the pseudoinverse, but...
+		let u = svd.u.unwrap();
 		let s_inverse = na::Matrix3::from_fn_generic(na::U3, na::U3, |i, j| {
-			if i != j { 0.0 } else { 1.0 / svd.singular_values[i] }
+			if i != j || svd.singular_values[i].abs() < 1e-6 { 0.0 } else { 1.0 / svd.singular_values[i] }
 		});
-		let pseudoinverse: na::Matrix3<f32> = (v_t * s_inverse) * svd.u.unwrap().transpose();
+		let pseudoinverse: na::Matrix3<f32> = u * s_inverse * v_t;
 		*/
+
+		/*
 		let svd: na::linalg::SVD<f32, na::U3, na::U3> = na::linalg::SVD::try_new(model_vectors, true, true, INITIAL_SVD_EPSILON, INITIAL_SVD_MAX_ITER).expect("Failed to compute initial decomposition for marker and vector. This can happen if marker size or focal length is zero.");
 		let v_t = svd.v_t.unwrap();
 		let pseudoinverse = svd.pseudo_inverse(INITIAL_SVD_EPSILON).expect("Failed to compute pseudoinverse.");
+		*/
 
 		// This was v.col(min_index) in the original, so it assumes that singular values are sorted.
+		// We're sorting greatest to smallest, so we need to take the _max_ column, which is the last one.
 		// Also since it's v_t we're grabbing a row.
-		let model_normal: na::Vector3<f32> = v_t.row(0).transpose();
+		// And since columns won't coerce to Vec3's, we do a transpose afterwards.
+		let model_normal: na::Vector3<f32> = v_t.row(2).transpose();
 
 		Self {
 			focal_length,
@@ -267,20 +274,6 @@ fn matrix_vector_dot(mat: &na::Matrix3<f32>, v: &na::Vector3<f32>) -> na::Vector
 		mt.column(0).dot(v),
 	)
 }
-/*
-Mat3.multVector = function(m, a){
-  m = m.m; a = a.v;
-
-  return new Vec3(
-    m[0][0] * a[0] + m[0][1] * a[1] + m[0][2] * a[2],
-    m[1][0] * a[0] + m[1][1] * a[1] + m[1][2] * a[2],
-    m[2][0] * a[0] + m[2][1] * a[1] + m[2][2] * a[2]);
-};
-
-x = r0.x * ax + r0.y *ay ...
-x = first mat row * vec
-== a * vT
-*/
 
 #[cfg(test)]
 mod tests {
@@ -316,14 +309,11 @@ mod tests {
 	#[test]
 	fn test_planar_translations() {
 		let pe = PoseEstimator::new(10.0, 1.0);
-		let marker_pts = vec![(0, 10), (10, 10), (10, 0), (0, 0)]; // Basically don't move from the origin.
+		let marker_pts = vec![(0, 5), (5, 5), (5, 0), (0, 0)]; // Move five units right and down and back five units.
 		let (c1, c2) = pe.estimate_marker_pose(&marker_pts);
-		dbg!(&c1.translation);
-		dbg!(&c1.rotation);
-		dbg!(&c1.error);
+		dbg!(&c1);
+		dbg!(&c2);
+		//let camera = na::Perspective3::new(1.0f32, 1.0, 1.0, 100.0).as_matrix();
 
-		dbg!(&c2.translation);
-		dbg!(&c2.rotation);
-		dbg!(&c2.error);
 	}
 }
