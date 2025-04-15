@@ -1,6 +1,7 @@
 mod aruco;
 mod dictionaries;
 mod pose;
+mod pinhole;
 
 pub use aruco::{Detector, DetectorConfig, Detection, Marker};
 pub use dictionaries::ARDictionary;

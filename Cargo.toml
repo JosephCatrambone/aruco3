@@ -19,6 +19,7 @@ rand = "0.9"
 minifb = "0.28"
 nokhwa = { version = "0.10.7", features = ["input-native", "output-threaded"] }
 kamera = "0.0.2"
+nalgebra-glm = "*"
 
 [[bench]]
 name = "detect_markers"

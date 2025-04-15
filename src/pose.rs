@@ -198,6 +198,7 @@ impl PoseEstimator {
 	}
 
 	// Computes the error for the given pose and points but DOES NOT assign it to the marker.
+	// We shouldn't assign the error as this is called with the same marker a bunch to try and find the min error.
 	fn compute_pose_error(&self, points: &Vec<(u32, u32)>, pose: &MarkerPose) -> f32 {
 		let reprojected_model = (0..4).map(|i| {
 			// Mulvector: eps = Vec3.addScalar( Vec3.multScalar( Mat3.multVector( this.modelVectors, rotation.row(2) ), 1.0 / translation.v[2]), 1.0);
@@ -275,6 +276,7 @@ fn matrix_vector_dot(mat: &na::Matrix3<f32>, v: &na::Vector3<f32>) -> na::Vector
 	)
 }
 
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -308,12 +310,54 @@ mod tests {
 
 	#[test]
 	fn test_planar_translations() {
+		use nalgebra as na;
+		
+		// Our object is translated along the x axis.
+		//let model = na::Isometry3::new(na::Vector3::x(), na::zero());
+		let model = na::Isometry3::new(na::zero(), na::zero());
+
+		// Our camera looks toward the point (0.0, 0.0, 0.0).
+		// It is located at (0.0, 0.0, 1.0).
+		// +y-up.
+		let eye    = na::Point3::new(0.0, 0.0, 10.0);
+		let target = na::Point3::new(0.0, 0.0, 0.0);
+		let view   = na::Isometry3::look_at_rh(&eye, &target, &na::Vector3::y());
+
+		// A perspective projection with aspect ratio 16:9 (1920x1080, for example).
+		let projection = na::Perspective3::new(1.0, 3.14 / 2.0, 1.0, 1000.0);
+
+		// The combination of the model with the view is still an isometry.
+		let model_view = view * model;
+
+		// Convert everything to a `Matrix4` so that they can be combined.
+		let mat_model_view = model_view.to_homogeneous();
+
+		// Combine everything.
+		let model_view_projection = projection.as_matrix() * mat_model_view;
+
+		// 10cm markers at the origin
+		let projected_a = model_view_projection.transform_vector(&na::Vector3::new(0.05, -0.05, 0.0));
+		let projected_b = model_view_projection.transform_vector(&na::Vector3::new(0.05, 0.05, 0.0));
+		let projected_c = model_view_projection.transform_vector(&na::Vector3::new(-0.05, 0.05, 0.0));
+		let projected_d = model_view_projection.transform_vector(&na::Vector3::new(-0.05, -0.05, 0.0));
+
+		println!("Projected points to {}, {}, {}, {}.", &projected_a, &projected_b, &projected_c, &projected_d);
+
 		let pe = PoseEstimator::new(10.0, 1.0);
-		let marker_pts = vec![(0, 5), (5, 5), (5, 0), (0, 0)]; // Move five units right and down and back five units.
+		let marker_pts = vec![
+			(projected_a.x as u32, projected_a.y as u32),
+			(projected_b.x as u32, projected_b.y as u32),
+			(projected_c.x as u32, projected_c.y as u32),
+			(projected_d.x as u32, projected_d.y as u32),
+		];
+
 		let (c1, c2) = pe.estimate_marker_pose(&marker_pts);
 		dbg!(&c1);
 		dbg!(&c2);
-		//let camera = na::Perspective3::new(1.0f32, 1.0, 1.0, 100.0).as_matrix();
 
+		//let camera = na::Perspective3::new(1.0f32, 1.0, 1.0, 100.0).as_matrix();
+		//let centered_points = make_marker_squares(10.0f32);
+		//let transformed_points = centered_points.iter().map(|p| { na::Matrix1x3::from(p.sub(&c1.translation).transpose()).mul(&c1.rotation.transpose()) }).collect::<Vec<na::Matrix1x3<f32>>>();
+		//dbg!(transformed_points);
 	}
 }
