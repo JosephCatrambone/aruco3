@@ -38,7 +38,7 @@ impl PoseEstimator {
 	fn new(marker_size: f32, focal_length: f32) -> Self {
 		let original_frame = make_marker_squares(marker_size);
 		let mut model_vectors: na::Matrix3<f32> = na::Matrix3::new(
-			// Why can't we just make this from a list of rows!?  Isnt' that the purpose of from_rows!?
+			// Why can't we just make this from a list of rows!?  Isn't that the purpose of from_rows!?
 			// na::RowVector3::from((original_frame[1] - original_frame[0]).into()),
 			original_frame[1].x - original_frame[0].x, original_frame[1].y - original_frame[0].y, original_frame[1].z - original_frame[0].z,
 			original_frame[2].x - original_frame[0].x, original_frame[2].y - original_frame[0].y, original_frame[2].z - original_frame[0].z,
@@ -46,6 +46,7 @@ impl PoseEstimator {
 		);
 
 		let pseudoinverse = model_vectors.pseudo_inverse(INITIAL_SVD_EPSILON).expect("Failed to compute initial pseudoinverse of model vectors. Is the focal distance real? Is the marker size nonzero?");
+		assert!(!pseudoinverse.sum().is_nan());
 		// Double check this:
 		let svd: na::linalg::SVD<f32, na::U3, na::U3> = na::linalg::SVD::try_new(model_vectors, true, true, INITIAL_SVD_EPSILON, INITIAL_SVD_MAX_ITER).expect("Failed to compute initial decomposition for marker and vector. This can happen if marker size or focal length is zero.");
 		let v_t = svd.v_t.unwrap();
@@ -175,6 +176,7 @@ impl PoseEstimator {
 	fn refine_pose(&self, points: &Vec<(u32, u32)>, pose: &mut MarkerPose) {
 		let mut previous_error = pose.error;
 		for _ in 0..MAX_POSE_ITERATIONS {
+			//assert!(!pose.error.is_nan());
 			// eps = Vec3.addScalar( Vec3.multScalar( Mat3.multVector( this.modelVectors, rotation.row(2) ), 1.0 / translation.v[2]), 1.0);
 			let rot_row_2 = pose.rotation.row(2);
 			let rot_vec_2 = na::Vector3::new(rot_row_2[0], rot_row_2[1], rot_row_2[2]); // It is infuriating we can't just do row(i).into()
@@ -202,39 +204,48 @@ impl PoseEstimator {
 	fn compute_pose_error(&self, points: &Vec<(u32, u32)>, pose: &MarkerPose) -> f32 {
 		let reprojected_model = (0..4).map(|i| {
 			// Mulvector: eps = Vec3.addScalar( Vec3.multScalar( Mat3.multVector( this.modelVectors, rotation.row(2) ), 1.0 / translation.v[2]), 1.0);
-			let mut v: na::Vector3<f32> = matrix_vector_dot(&pose.rotation, &self.untransformed_marker_points[i]).scale(1.0f32 / pose.translation.z).add_scalar(1.0);
-			//let mut v: na::Vector3<f32> = pose.rotation.mul(self.planar_pose.row(i)).add(pose.translation);
+			let mut v: na::Vector3<f32> = matrix_vector_dot(&pose.rotation, &self.untransformed_marker_points[i]).add(&pose.translation);
+			//let mut v: na::Vector3<f32> = matrix_vector_dot(&pose.rotation, &self.untransformed_marker_points[i]).scale(1.0f32 / pose.translation.z).add_scalar(1.0);
+			//let mut v: na::Vector3<f32> = pose.rotation.mul(&self.untransformed_marker_points[i]).add(pose.translation);
 			v *= self.focal_length / v.z;
 			v
 		}).collect::<Vec<na::Vector3<f32>>>();
 
-		let errors = (0..4).map(|i| {
-			// Angles 013, 120, 231, 302
-			// a {0123}, b {1230}, c {3012}
-			let idx_a = i;
-			let idx_b = (idx_a+1)%4;
-			let idx_c = (idx_a+3)%4;
+		let mut errors = 0.0;
+		for (idx_a, idx_b, idx_c) in [(0, 1, 3), (1, 2, 0), (2, 1, 3), (3, 0, 2)] {
 			let interior_angle = angle_points(&points[idx_a], &points[idx_b], &points[idx_c]);
 			let projected_angle = angle2d(&reprojected_model[idx_a], &reprojected_model[idx_b], &reprojected_model[idx_c]);
-			(interior_angle - projected_angle).abs()
-		});
-
-		errors.sum::<f32>() / 4.0
+			let angle_error = (interior_angle - projected_angle).abs() / 4.0;
+			errors += angle_error;
+		}
+		errors
 	}
 }
 
 fn make_marker_squares(size: f32) -> Vec<na::Vector3<f32>> {
 	let hs = size/2.0f32;
+	// In screen space, -y is up and +x is right.
+	// In world space we're taking Z to be forward from the camera and +x to be right.
+
 	// (This one?) If +y is down and -x is left: lower left, lower right, upper right, upper left, counter-clockwise
-	// If += is up and -x is left: upper left, upper right, lower right, lower left, clockwise
+	// If +y is up and -x is left: upper left, upper right, lower right, lower left, clockwise
 	vec![
 		na::Vector3::<f32>::new(-hs, hs, 0.0),
 		na::Vector3::<f32>::new(hs, hs, 0.0),
 		na::Vector3::<f32>::new(hs, -hs, 0.0),
 		na::Vector3::<f32>::new(-hs, -hs, 0.0),
 	]
+	/*
+	vec![
+		na::Vector3::<f32>::new(-hs, -hs, 0.0),
+		na::Vector3::<f32>::new(-hs, hs, 0.0),
+		na::Vector3::<f32>::new(hs, hs, 0.0),
+		na::Vector3::<f32>::new(hs, -hs, 0.0),
+	]
+	*/
 }
 
+/// Given ABC, compute the angle between AB and AC.  A is the corner.
 fn angle_points(a: &(u32, u32), b: &(u32, u32), c: &(u32, u32)) -> f32 {
 	let p = na::Vector3::new(a.0 as f32, a.1 as f32, 0.0f32);
 	let q = na::Vector3::new(b.0 as f32, b.1 as f32, 0.0f32);
@@ -252,17 +263,21 @@ fn angle2d(a: &na::Vector3<f32>, b: &na::Vector3<f32>, c: &na::Vector3<f32>) -> 
 
 /// Compute the angle between lines AB and AC.
 fn angle(a: &na::Vector3<f32>, b: &na::Vector3<f32>, c: &na::Vector3<f32>) -> f32 {
+	// a dot b = ||a|| * ||b|| * cos(theta)
 	//fn angle<D, M>(a: &M, b: &M, c: &M) -> f32 where M: na::Matrix<f32, U1, D, na::ArrayStorage<f32, 1, D>> {
 	// It would be really nice to make this generic over Vector.
-	let p = b-a;
-	let q = c-a;
-	let dot = p.dot(&q);
+	let mut p = b-a;
+	let mut q = c-a;
 	let pmag = p.magnitude();
 	let qmag = q.magnitude();
-	if pmag < 1e-6 || qmag < 1e-6 {
-		return dot.acos();
+	let dot = p.dot(&q);
+	let normalized_dot = dot / (pmag * qmag);
+	#[cfg(debug_assertions)]
+	if normalized_dot.is_infinite() || normalized_dot.is_nan() || normalized_dot < -1.1f32 || normalized_dot > 1.1f32 {
+		eprintln!("angle() called with bad numerical values: {}, {}, {}", &a, &b, &c);
+		eprintln!("Normalized Dot: {}\nInfinite: {}\nNormalized is NaN: {}\nNormalized dot < -1.0: {}\nNormalized dot > 1.0: {}", normalized_dot, normalized_dot.is_infinite(), normalized_dot.is_nan(), normalized_dot < -1.0, normalized_dot > 1.0);
 	}
-	dot.acos() / (pmag * qmag)
+	normalized_dot.max(-1.0).min(1.0).acos()
 }
 
 /// Computes a new vec3 from the dot product of each matrix row with the given vector.
@@ -281,6 +296,7 @@ fn matrix_vector_dot(mat: &na::Matrix3<f32>, v: &na::Vector3<f32>) -> na::Vector
 mod tests {
 	use super::*;
 	use nalgebra as na;
+	use std::f32::consts::PI;
 
 	#[test]
 	fn test_cos_angle() {
@@ -299,6 +315,20 @@ mod tests {
 	}
 
 	#[test]
+	fn test_cos_angle_domain() {
+		// From a bug where we got stuff out of range which caused all kinds of problems.
+		let mut a = na::Vector3::new(813.0, 423.0, 0.0);
+		let mut b = na::Vector3::new(1095.0, 453.0, 1.0);
+		let mut c = na::Vector3::new(769.0, 693.0, 0.0);
+		assert!(!angle(&a, &b, &c).is_nan());
+
+		a = na::Vector3::new(-5896.0, -2020.6613, 0.0);
+		b = na::Vector3::new(4.2192984, 24.331556, 0.0);
+		c = na::Vector3::new(66.10354, 45.78034, 0.0);
+		assert!(!angle(&a, &b, &c).is_nan());
+	}
+
+	#[test]
 	fn test_init() {
 		let pe = PoseEstimator::new(10.0, 1.0);
 		dbg!(&pe);
@@ -309,41 +339,79 @@ mod tests {
 	}
 
 	#[test]
+	fn test_detection_from_known_pose() {
+		let corners = vec![
+			(
+				813u32,
+				423,
+			),
+			(
+				1098,
+				453,
+			),
+			(
+				1071,
+				726,
+			),
+			(
+				769,
+				693,
+			),
+		];
+		let marker_size_cm = 40f32; // Is this in mm or cm?
+		let focal_length_mm = 35f32;
+		let sensor_width_mm = 35f32; // Yes, same as width.
+		let image_width = 1920;
+		let image_height = 1080;
+		let camera_transform_m = (0.141521, -0.959589, 2.41665);
+		let camera_rotation_deg = (22.76, -0.00019, 6.643);
+
+		let pe = PoseEstimator::new(marker_size_cm, focal_length_mm);
+
+		let (c1, c2) = pe.estimate_marker_pose(&corners);
+		dbg!(&c1);
+		dbg!(&c2);
+	}
+
+	#[test]
 	fn test_planar_translations() {
 		use nalgebra as na;
-		
-		// Our object is translated along the x axis.
-		//let model = na::Isometry3::new(na::Vector3::x(), na::zero());
-		let model = na::Isometry3::new(na::zero(), na::zero());
+		use nalgebra_glm as glm;
 
-		// Our camera looks toward the point (0.0, 0.0, 0.0).
-		// It is located at (0.0, 0.0, 1.0).
-		// +y-up.
-		let eye    = na::Point3::new(0.0, 0.0, 10.0);
-		let target = na::Point3::new(0.0, 0.0, 0.0);
-		let view   = na::Isometry3::look_at_rh(&eye, &target, &na::Vector3::y());
+		let FOV = PI / 2.0f32;
+		let focal_length = 1.0f32;// /(FOV/2.0f32).tan(); // FOV = 2*arctan(sensor_size/2*focal_length) -> tan(FOV/2) = sensor_size/(2*focal_len) -> (2*focal_len)*tan(FOV/2) = sensor_size -> 2*focal_len = sensor_size/tan(FOV/2)
+		let image_width = 640f32;
+		let image_height = 480f32;
+		let camera_position = glm::vec3(0f32, 0f32, -10f32);
 
-		// A perspective projection with aspect ratio 16:9 (1920x1080, for example).
-		let projection = na::Perspective3::new(1.0, 3.14 / 2.0, 1.0, 1000.0);
+		// Four points sitting upright with +y up and +x right.
+		// Lower left is at the origin.
+		let marker_ll = glm::vec3(0.0f32, 0.0f32, 0.0f32);
+		let marker_lr = glm::vec3(0.1f32, 0.0f32, 0.0f32);
+		let marker_ur = glm::vec3(0.1f32, 0.1f32, 0.0f32);
+		let marker_ul = glm::vec3(0.0f32, 0.1f32, 0.0f32);
+		//glm::project_no()
 
-		// The combination of the model with the view is still an isometry.
-		let model_view = view * model;
+		// [Model Coords] -(model matrix)-> [World Coordinates] -(view matrix)-> [Camera Coordinates] -(projection matrix)-> [Homogeneous Coordinates]
+		// Model-View matrix positions the camera in OpenGL (generally via look-at).
 
-		// Convert everything to a `Matrix4` so that they can be combined.
-		let mat_model_view = model_view.to_homogeneous();
-
-		// Combine everything.
-		let model_view_projection = projection.as_matrix() * mat_model_view;
-
-		// 10cm markers at the origin
-		let projected_a = model_view_projection.transform_vector(&na::Vector3::new(0.05, -0.05, 0.0));
-		let projected_b = model_view_projection.transform_vector(&na::Vector3::new(0.05, 0.05, 0.0));
-		let projected_c = model_view_projection.transform_vector(&na::Vector3::new(-0.05, 0.05, 0.0));
-		let projected_d = model_view_projection.transform_vector(&na::Vector3::new(-0.05, -0.05, 0.0));
+		// Stick with OpenGL +y up left-handed.
+		let mvm = glm::look_at_lh(&camera_position, &[0f32, 0f32, 0f32].into(), &[0f32, 1f32, 0f32].into());
+		let projm = glm::perspective_fov_lh_no(PI / 2.0f32, image_width, image_height, 1.0f32, 100f32);
+		let viewport = glm::vec4(0.0f32, 0.0f32, image_width, image_height); // Lower left, upper right, XY, WH.
+		// Ordering for projection is UL, UR, LR, LL
+		let mut projected_a = glm::project_no(&marker_ul, &mvm, &projm, viewport.clone());
+		let mut projected_b = glm::project_no(&marker_ur, &mvm, &projm, viewport.clone());
+		let mut projected_c = glm::project_no(&marker_lr, &mvm, &projm, viewport.clone());
+		let mut projected_d = glm::project_no(&marker_ll, &mvm, &projm, viewport.clone());
+		projected_a /= projected_a.z;
+		projected_b /= projected_b.z;
+		projected_c /= projected_c.z;
+		projected_d /= projected_d.z;
 
 		println!("Projected points to {}, {}, {}, {}.", &projected_a, &projected_b, &projected_c, &projected_d);
 
-		let pe = PoseEstimator::new(10.0, 1.0);
+		let pe = PoseEstimator::new(10.0, focal_length);
 		let marker_pts = vec![
 			(projected_a.x as u32, projected_a.y as u32),
 			(projected_b.x as u32, projected_b.y as u32),
