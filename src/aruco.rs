@@ -356,10 +356,11 @@ mod tests {
 		for (idx, entry) in read_dir(&asset_path).unwrap().enumerate() {
 			let entry = entry.unwrap();
 			let path = entry.path();
-			let test_image: Result<DynamicImage, image::ImageError> = image::open(path);
+			let test_image: Result<DynamicImage, image::ImageError> = image::open(path.clone());
 			if test_image.is_err() {
 				continue;
 			}
+			dbg!(&path);
 			let test_image: DynamicImage = test_image.unwrap();
 			let detection = detector.detect(test_image.clone());
 			let mut debug_image = test_image.clone().into_rgba8();

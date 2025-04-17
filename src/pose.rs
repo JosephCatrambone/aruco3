@@ -12,9 +12,9 @@ pub struct PoseEstimator {
 	focal_length: f32,
 	marker_size: f32,
 	untransformed_marker_points: Vec<na::Vector3<f32>>,
-	model_vectors: na::Matrix3<f32>,
+	model_vectors: na::Matrix4x3<f32>,
 	model_normal: na::Vector3<f32>,
-	pseudoinverse: na::Matrix3<f32>,
+	pseudoinverse: na::Matrix3x4<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,39 +37,55 @@ impl Default for MarkerPose {
 impl PoseEstimator {
 	fn new(marker_size: f32, focal_length: f32) -> Self {
 		let original_frame = make_marker_squares(marker_size);
-		let mut model_vectors: na::Matrix3<f32> = na::Matrix3::new(
+		let mut model_vectors: na::Matrix4x3<f32> = na::Matrix4x3::new(
 			// Why can't we just make this from a list of rows!?  Isn't that the purpose of from_rows!?
 			// na::RowVector3::from((original_frame[1] - original_frame[0]).into()),
+			0.0f32, 0.0f32, 0.0f32,
 			original_frame[1].x - original_frame[0].x, original_frame[1].y - original_frame[0].y, original_frame[1].z - original_frame[0].z,
 			original_frame[2].x - original_frame[0].x, original_frame[2].y - original_frame[0].y, original_frame[2].z - original_frame[0].z,
 			original_frame[3].x - original_frame[0].x, original_frame[3].y - original_frame[0].y, original_frame[3].z - original_frame[0].z,
 		);
 
 		let pseudoinverse = model_vectors.pseudo_inverse(INITIAL_SVD_EPSILON).expect("Failed to compute initial pseudoinverse of model vectors. Is the focal distance real? Is the marker size nonzero?");
-		assert!(!pseudoinverse.sum().is_nan());
-		// Double check this:
-		let svd: na::linalg::SVD<f32, na::U3, na::U3> = na::linalg::SVD::try_new(model_vectors, true, true, INITIAL_SVD_EPSILON, INITIAL_SVD_MAX_ITER).expect("Failed to compute initial decomposition for marker and vector. This can happen if marker size or focal length is zero.");
-		let v_t = svd.v_t.unwrap();
-		/*
-		// Ideally since we're computing the SVD once we should just multiply it back out to get the pseudoinverse, but...
-		let u = svd.u.unwrap();
-		let s_inverse = na::Matrix3::from_fn_generic(na::U3, na::U3, |i, j| {
-			if i != j || svd.singular_values[i].abs() < 1e-6 { 0.0 } else { 1.0 / svd.singular_values[i] }
-		});
-		let pseudoinverse: na::Matrix3<f32> = u * s_inverse * v_t;
-		*/
 
-		/*
-		let svd: na::linalg::SVD<f32, na::U3, na::U3> = na::linalg::SVD::try_new(model_vectors, true, true, INITIAL_SVD_EPSILON, INITIAL_SVD_MAX_ITER).expect("Failed to compute initial decomposition for marker and vector. This can happen if marker size or focal length is zero.");
-		let v_t = svd.v_t.unwrap();
-		let pseudoinverse = svd.pseudo_inverse(INITIAL_SVD_EPSILON).expect("Failed to compute pseudoinverse.");
-		*/
+		let norm_from_svd = false;
+		let model_normal = if norm_from_svd {
+			// Double check this:
+			let svd: na::linalg::SVD<f32, na::U4, na::U3> = na::linalg::SVD::try_new(model_vectors, true, true, INITIAL_SVD_EPSILON, INITIAL_SVD_MAX_ITER).expect("Failed to compute initial decomposition for marker and vector. This can happen if marker size or focal length is zero.");
+			let v_t = svd.v_t.unwrap();
+			/*
+			// Since we need to compute the SVD anyway it's probably more efficient to use it to build the pseudoinverse, rather than compute it above.
+			let u = svd.u.unwrap();
+			let s_inverse = na::Matrix3::from_fn_generic(na::U3, na::U3, |i, j| {
+				if i != j || svd.singular_values[i].abs() < 1e-6 { 0.0 } else { 1.0 / svd.singular_values[i] }
+			});
+			//let pseudoinverse: na::Matrix3x4<f32> = u * s_inverse * v_t;
+			let pseudoinverse: na::Matrix3x4<f32> = v_t * s_inverse * u.transpose();
+			*/
 
-		// This was v.col(min_index) in the original, so it assumes that singular values are sorted.
-		// We're sorting greatest to smallest, so we need to take the _max_ column, which is the last one.
-		// Also since it's v_t we're grabbing a row.
-		// And since columns won't coerce to Vec3's, we do a transpose afterwards.
-		let model_normal: na::Vector3<f32> = v_t.row(2).transpose();
+			// This was v.col(min_index) in the original, so it assumes that singular values are sorted.
+			// We're sorting greatest to smallest, so we need to take the _max_ column, which is the last one.
+			// Also since it's v_t we're grabbing a row.
+			// And since columns won't coerce to Vec3's, we do a transpose afterwards.
+			//let model_normal: na::Vector3<f32> = v_t.column(2).into();
+			let mut model_normal: na::Vector3<f32> = v_t.row(2).transpose();
+			model_normal
+		} else {
+			// I've seen this implemented in two ways: doing the cross and pulling from SVD:
+			// The model normal needs to be corrected so make sure the length is nonzero.
+			// We already use vec0 as an origin, so try crossing v1 with v2 and v1 with v3.
+			let candidate_normal_1 = model_vectors.row(1).cross(&model_vectors.row(2));
+			let candidate_normal_2 = model_vectors.row(1).cross(&model_vectors.row(3));
+			let model_normal = if candidate_normal_1.magnitude() > 0.0f32 {
+				candidate_normal_1.transpose().into()
+			} else if candidate_normal_2.magnitude() > 0.0f32 {
+				candidate_normal_2.transpose().into()
+			} else {
+				panic!("Failed to get normal from marker: points may be degenerate. Is marker size nonzero? Are the points unique?");
+			};
+			model_normal.normalize_mut();
+			model_normal
+		};
 
 		Self {
 			focal_length,
@@ -91,7 +107,8 @@ impl PoseEstimator {
 		let mut candidate1 = MarkerPose::default();
 		let mut candidate2 = MarkerPose::default();
 
-		self.pose_from_orthography_and_scaling(points, &mut epsilon_step, &mut candidate1, &mut candidate2);
+		//self.pose_from_orthography_and_scaling(points, &mut epsilon_step, &mut candidate1, &mut candidate2);
+		self.pose_estimate(points, &mut candidate1, &mut candidate2);
 		self.refine_pose(points, &mut candidate1);
 		self.refine_pose(points, &mut candidate2);
 
@@ -100,6 +117,76 @@ impl PoseEstimator {
 		} else {
 			(candidate2, candidate1)
 		}
+	}
+
+	fn pose_estimate(&self, camera_points: &Vec<(u32, u32)>, cand1: &mut MarkerPose, cand2: &mut MarkerPose) {
+		//"Iterative Pose Estimation using Coplanar Feature Points" by Denis Oberkampf, Daniel F. DeMenthon, Larry S. Davis
+		// http://www.cfar.umd.edu/~daniel/daniel_papersfordownload/CoplanarPts.pdf
+
+		// Compute the image vectors, a set of points WRT the 0-th item (top left).
+		// We expect to have four, with the first being (0,0).
+		let marker_origin_x = camera_points[0].0 as f32;
+		let marker_origin_y = camera_points[0].1 as f32;
+		let mut image_vectors = Vec::<(f32, f32)>::with_capacity(4);
+		for i in 0usize..4 {
+			image_vectors.push((camera_points[i].0 as f32 - marker_origin_x, camera_points[i].1 as f32 - marker_origin_y));
+		}
+
+		let mut i0 = na::Vector3::new(0f32, 0f32, 0f32);
+		let mut j0 = na::Vector3::new(0f32, 0f32, 0f32);
+		for j in 0..4 {
+			i0.x += self.pseudoinverse.get((0,j)).unwrap() * image_vectors[j].0;
+			i0.y += self.pseudoinverse.get((1,j)).unwrap() * image_vectors[j].0;
+			i0.z += self.pseudoinverse.get((2,j)).unwrap() * image_vectors[j].0;
+			j0.x += self.pseudoinverse.get((0,j)).unwrap() * image_vectors[j].1;
+			j0.y += self.pseudoinverse.get((1,j)).unwrap() * image_vectors[j].1;
+			j0.z += self.pseudoinverse.get((2,j)).unwrap() * image_vectors[j].1;
+		}
+		let i0i0 = i0.dot(&i0);
+		let j0j0 = j0.dot(&j0);
+		let i0j0 = i0.dot(&j0);
+
+		let delta = (j0j0 - i0i0) * (j0j0 - i0i0) + 4.0 * (i0j0*i0j0);
+		let q = if j0j0 - i0i0 > 0.0 {
+			(j0j0 - i0i0 + delta.sqrt()) / 2.0
+		} else {
+			(j0j0 - i0i0 - delta.sqrt()) / 2.0
+		};
+
+		let mut lambda = 0.0;
+		let mut mu = 0.0;
+		if q >= 0.0 {
+			lambda = q.sqrt();
+			mu = if lambda.abs() < 1e-6 {
+				0.0
+			} else {
+				-i0j0 / lambda
+			};
+		} else {
+			lambda = (-(i0j0 * i0j0) / q).sqrt();
+			mu = if lambda.abs() < 1e-6 {
+				(i0i0 - j0j0).sqrt()
+			} else {
+				-i0j0 / lambda
+			};
+		}
+		let compute_rot = |out: &mut MarkerPose, lm_sign: f32| {
+			let ivec = i0 + self.model_normal.scale(lm_sign * lambda);
+			let jvec = i0 + self.model_normal.scale(lm_sign * mu);
+			let scale = ivec.magnitude(); // ivec.dot(&ivec).sqrt();
+			let row1 = ivec.scale(1.0 / scale);
+			let row2 = jvec.scale(1.0 / scale);
+			let row3 = row1.cross(&row2);
+			out.rotation.set_row(0, &row1.transpose());
+			out.rotation.set_row(1, &row2.transpose());
+			out.rotation.set_row(2, &row3.transpose());
+			out.translation.x = camera_points[0].0 as f32 / scale;
+			out.translation.y = camera_points[0].1 as f32 / scale;
+			out.translation.z = self.focal_length / scale;
+			out.error = self.compute_pose_error(camera_points, &out);
+		};
+		compute_rot(cand1, 1f32);
+		compute_rot(cand2, -1f32);
 	}
 
 	fn pose_from_orthography_and_scaling(&self, camera_points: &Vec<(u32, u32)>, epsilon: &mut na::Vector3<f32>, cand1: &mut MarkerPose, cand2: &mut MarkerPose) {
@@ -111,8 +198,11 @@ impl PoseEstimator {
 		let yi = na::Vector3::new(camera_points[1].1 as f32, camera_points[2].1 as f32,camera_points[3].1 as f32);
 		let xs: na::Vector3<f32> = xi.component_mul(epsilon).add_scalar(-(camera_points[0].0 as f32)).into();
 		let ys: na::Vector3<f32> = yi.component_mul(epsilon).add_scalar(-(camera_points[0].1 as f32)).into();
-		let i0 = matrix_vector_dot(&self.pseudoinverse, &xs);
-		let j0 = matrix_vector_dot(&self.pseudoinverse, &ys);
+		todo!("There's a dimension mismatch because pseudoinverse is 4x3 instead of 3x3.");
+		let i0 = na::Vector3::new(0.0f32, 0.0f32, 0.0f32);
+		let j0 = na::Vector3::new(0.0f32, 0.0f32, 0.0f32);
+		//let i0 = matrix_vector_dot(&self.pseudoinverse, &xs);
+		//let j0 = matrix_vector_dot(&self.pseudoinverse, &ys);
 		let s = j0.dot(&j0) - i0.dot(&i0);
 		let ij = i0.dot(&j0);  // How close are these to orthogonal?
 
@@ -181,11 +271,12 @@ impl PoseEstimator {
 			let rot_row_2 = pose.rotation.row(2);
 			let rot_vec_2 = na::Vector3::new(rot_row_2[0], rot_row_2[1], rot_row_2[2]); // It is infuriating we can't just do row(i).into()
 			//let mut new_epsilon: na::Vector3<f32> = matrix_vector_dot(&self.model_vectors, &(pose.rotation.row(2).into())).mul(1.0 / pose.translation.z).add_scalar(1.0f32);
-			let mut new_epsilon: na::Vector3<f32> = matrix_vector_dot(&self.model_vectors, &rot_vec_2).mul(1.0 / pose.translation.z).add_scalar(1.0f32);
+			//let mut new_epsilon: na::Vector3<f32> = matrix_vector_dot(&self.model_vectors, &rot_vec_2).mul(1.0 / pose.translation.z).add_scalar(1.0f32);
 			let mut new_c1 = pose.clone();
 			let mut new_c2 = pose.clone();
 
-			self.pose_from_orthography_and_scaling(points, &mut new_epsilon, &mut new_c1, &mut new_c2);
+			//self.pose_from_orthography_and_scaling(points, &mut new_epsilon, &mut new_c1, &mut new_c2);
+			self.pose_estimate(points, &mut new_c1, &mut new_c2);
 
 			if new_c1.error < new_c2.error {
 				*pose = new_c1;
@@ -330,16 +421,74 @@ mod tests {
 
 	#[test]
 	fn test_init() {
-		let pe = PoseEstimator::new(10.0, 1.0);
-		dbg!(&pe);
-		let marker_pts = vec![(0, 10), (10, 10), (10, 0), (0, 0)];
-		let (c1, c2) = pe.estimate_marker_pose(&marker_pts);
-		dbg!(&c1.translation);
-		dbg!(&c1.rotation);
+		let pe = PoseEstimator::new(35.0, 320.0);
+		// Vectors internally should be (0,0), (35,0), (35,-35), (0,-35)
+		// Obj normal should be 0,0,-1
+		// Pseudoinverse should be 3x4
+		/*
+		0: (4) […]
+			0: -4.186041222059461e-19
+			1: 0.01904761904761905
+			2: 0.009523809523809518
+			3: -0.009523809523809528
+		1: (4) […]
+			0: -8.37208244411892e-19
+			1: 0.009523809523809528
+			2: -0.009523809523809526
+			3: -0.019047619047619056
+		2: (4) […]
+			0: 0
+			1: 0
+			2: 0
+			3: 0
+		*/
+		assert!(pe.model_normal.x.abs() < 1e-6f32 && pe.model_normal.y.abs() < 1e-6f32 && (pe.model_normal.z - -1f32).abs() < 1e-6);
+		assert_eq!(&pe.pseudoinverse.shape(), &(3usize, 4usize));
+		assert!((pe.pseudoinverse - na::Matrix3x4::new(
+			0.0, 0.01904761904761905, 0.009523809523809518, -0.009523809523809528,
+			0.0, 0.009523809523809528, -0.009523809523809526, -0.019047619047619056,
+			0.0, 0.0, 0.0, 0.0
+		)).abs().sum() < 1e-5f32);
 	}
 
 	#[test]
-	fn test_detection_from_known_pose() {
+	fn test_known_offset1() {
+		let corners = vec![
+			(
+				575,
+				156,
+			),
+			(
+				1344,
+				156,
+			),
+			(
+				1343,
+				924,
+			),
+			(
+				576,
+				924,
+			),
+		];
+
+		let marker_size_cm = 40f32; // Is this in mm or cm?
+		let focal_length_mm = 35f32;
+		let sensor_width_mm = 35f32; // Yes, same as width.
+		let image_width = 1920;
+		let image_height = 1080;
+		let camera_transform_m = (0f32, 0f32, -1f32);
+		let camera_rotation_deg = (0.0, 0.0, 0.0);
+
+		let pe = PoseEstimator::new(marker_size_cm, focal_length_mm);
+
+		let (c1, c2) = pe.estimate_marker_pose(&corners);
+		dbg!(&c1);
+		dbg!(&c2);
+	}
+
+	#[test]
+	fn test_known_offset2() {
 		let corners = vec![
 			(
 				813u32,
