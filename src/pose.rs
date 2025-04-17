@@ -9,6 +9,7 @@ const MAX_POSE_ITERATIONS: usize = 100;
 // It's faster to update a pose than to recompute it from scratch.
 #[derive(Debug)]
 pub struct PoseEstimator {
+	image_size: (u32, u32),
 	focal_length: f32,
 	marker_size: f32,
 	untransformed_marker_points: Vec<na::Vector3<f32>>,
@@ -35,7 +36,7 @@ impl Default for MarkerPose {
 }
 
 impl PoseEstimator {
-	fn new(marker_size: f32, focal_length: f32) -> Self {
+	fn new(image_size: (u32, u32), marker_size: f32, focal_length: f32) -> Self {
 		let original_frame = make_marker_squares(marker_size);
 		let mut model_vectors: na::Matrix4x3<f32> = na::Matrix4x3::new(
 			// Why can't we just make this from a list of rows!?  Isn't that the purpose of from_rows!?
@@ -76,7 +77,7 @@ impl PoseEstimator {
 			// We already use vec0 as an origin, so try crossing v1 with v2 and v1 with v3.
 			let candidate_normal_1 = model_vectors.row(1).cross(&model_vectors.row(2));
 			let candidate_normal_2 = model_vectors.row(1).cross(&model_vectors.row(3));
-			let model_normal = if candidate_normal_1.magnitude() > 0.0f32 {
+			let mut model_normal: na::Vector3<f32> = if candidate_normal_1.magnitude() > 0.0f32 {
 				candidate_normal_1.transpose().into()
 			} else if candidate_normal_2.magnitude() > 0.0f32 {
 				candidate_normal_2.transpose().into()
@@ -88,6 +89,7 @@ impl PoseEstimator {
 		};
 
 		Self {
+			image_size,
 			focal_length,
 			marker_size,
 			untransformed_marker_points: original_frame,
@@ -98,35 +100,31 @@ impl PoseEstimator {
 	}
 
 	pub fn estimate_marker_pose(&self, points: &Vec<(u32, u32)>) -> (MarkerPose, MarkerPose) {
-		// I hate keeping this as Vector3 instead of na::Matrix1x3<f32> because the xyz aspect is confusing, but the ergonomics of Matrix1x3 are wrong.
-		let mut epsilon_step = na::Vector3::new(1.0f32, 1.0f32, 1.0f32);
-
-		// x_i(1+epsilon_i) is the coordinate x'_i of the point p_i, the scaled orthographic projection of point M_i.
-		// M_i is the point somewhere in space.  p_i is the projection of the point
+		// Recenter based on image size AND flip +y to be up:
+		let points: Vec<(f32, f32)> = points.iter().map(|p| { (p.0 as f32 - (self.image_size.0 as f32 * 0.5f32), (self.image_size.1 as f32 * 0.5f32) - p.1 as f32)  }).collect();
 
 		let mut candidate1 = MarkerPose::default();
 		let mut candidate2 = MarkerPose::default();
 
-		//self.pose_from_orthography_and_scaling(points, &mut epsilon_step, &mut candidate1, &mut candidate2);
-		self.pose_estimate(points, &mut candidate1, &mut candidate2);
-		self.refine_pose(points, &mut candidate1);
-		self.refine_pose(points, &mut candidate2);
+		self.make_initial_estimate(&points, &mut candidate1, &mut candidate2);
+		//self.refine_pose(&points, &mut candidate1);
+		//self.refine_pose(&points, &mut candidate2);
 
-		if candidate1.error < candidate2.error {
+		if candidate1.error <= candidate2.error {
 			(candidate1, candidate2)
 		} else {
 			(candidate2, candidate1)
 		}
 	}
 
-	fn pose_estimate(&self, camera_points: &Vec<(u32, u32)>, cand1: &mut MarkerPose, cand2: &mut MarkerPose) {
+	fn make_initial_estimate(&self, camera_points: &Vec<(f32, f32)>, cand1: &mut MarkerPose, cand2: &mut MarkerPose) {
 		//"Iterative Pose Estimation using Coplanar Feature Points" by Denis Oberkampf, Daniel F. DeMenthon, Larry S. Davis
 		// http://www.cfar.umd.edu/~daniel/daniel_papersfordownload/CoplanarPts.pdf
 
 		// Compute the image vectors, a set of points WRT the 0-th item (top left).
 		// We expect to have four, with the first being (0,0).
-		let marker_origin_x = camera_points[0].0 as f32;
-		let marker_origin_y = camera_points[0].1 as f32;
+		let marker_origin_x = camera_points[0].0;
+		let marker_origin_y = camera_points[0].1;
 		let mut image_vectors = Vec::<(f32, f32)>::with_capacity(4);
 		for i in 0usize..4 {
 			image_vectors.push((camera_points[i].0 as f32 - marker_origin_x, camera_points[i].1 as f32 - marker_origin_y));
@@ -172,7 +170,7 @@ impl PoseEstimator {
 		}
 		let compute_rot = |out: &mut MarkerPose, lm_sign: f32| {
 			let ivec = i0 + self.model_normal.scale(lm_sign * lambda);
-			let jvec = i0 + self.model_normal.scale(lm_sign * mu);
+			let jvec = j0 + self.model_normal.scale(lm_sign * mu);
 			let scale = ivec.magnitude(); // ivec.dot(&ivec).sqrt();
 			let row1 = ivec.scale(1.0 / scale);
 			let row2 = jvec.scale(1.0 / scale);
@@ -189,81 +187,9 @@ impl PoseEstimator {
 		compute_rot(cand2, -1f32);
 	}
 
-	fn pose_from_orthography_and_scaling(&self, camera_points: &Vec<(u32, u32)>, epsilon: &mut na::Vector3<f32>, cand1: &mut MarkerPose, cand2: &mut MarkerPose) {
-		// "Iterative Pose Estimation Using Coplanar Feature Points" by D OBERKAMPF et al.
-		// A lot of these magic variables don't have direct translations into something that will be conceptually helpful in understanding the code.
-		// My comments are, at best, a description of my limited understanding of the various transformations, and even with visual aids assigning real names to the variables is like trying to describe 'the color blue'.
-		// Given this fact, I'll use variable names that stick to the paper and leave comments describing the algorithm.
-		let xi = na::Vector3::new(camera_points[1].0 as f32, camera_points[2].0 as f32,camera_points[3].0 as f32);
-		let yi = na::Vector3::new(camera_points[1].1 as f32, camera_points[2].1 as f32,camera_points[3].1 as f32);
-		let xs: na::Vector3<f32> = xi.component_mul(epsilon).add_scalar(-(camera_points[0].0 as f32)).into();
-		let ys: na::Vector3<f32> = yi.component_mul(epsilon).add_scalar(-(camera_points[0].1 as f32)).into();
-		todo!("There's a dimension mismatch because pseudoinverse is 4x3 instead of 3x3.");
-		let i0 = na::Vector3::new(0.0f32, 0.0f32, 0.0f32);
-		let j0 = na::Vector3::new(0.0f32, 0.0f32, 0.0f32);
-		//let i0 = matrix_vector_dot(&self.pseudoinverse, &xs);
-		//let j0 = matrix_vector_dot(&self.pseudoinverse, &ys);
-		let s = j0.dot(&j0) - i0.dot(&i0);
-		let ij = i0.dot(&j0);  // How close are these to orthogonal?
-
-		let mut r = 0.0;
-		let mut theta = 0.0;
-
-		if s.abs() == 0.0 { // Less than epsilon, maybe?  I don't like the abs comparison with float.
-			r = 2.0f32*ij.abs().sqrt();
-			if ij < 0.0 {
-				theta = std::f32::consts::PI / 2.0;
-			} else if ij > 0.0 {
-				theta = -std::f32::consts::PI / 2.0;
-			} else {
-				theta = 0.0;
-			}
-		} else {
-			// See page 12 of "Iterative Pose Estimation Using Coplanar Feature Points" by D OBERKAMPF et al.
-			r = ((s*s) + (4.0*ij*ij)).sqrt().sqrt();
-			theta = (2.0 * ij / s).atan();
-			if s < 0.0 {
-				theta += std::f32::consts::PI;
-			}
-			theta /= 2.0;
-		}
-
-		// In the paper these are the real and imaginary parts of C, coming from the system of equations for solutions of coplanar points.
-		let lambda = r*theta.cos();
-		let mu = r*theta.sin();
-
-		// In one candidate pose we add and in the other we subtract.
-		for (cand, vecadd) in [cand1, cand2].iter_mut().zip([true, false]) {
-			let (mut i, mut j) = if vecadd {
-				(na::Vector3::from((self.model_normal*lambda) + i0),
-				na::Vector3::from((self.model_normal*mu) + j0))
-			} else {
-				(na::Vector3::from((self.model_normal*lambda) - i0),
-				na::Vector3::from((self.model_normal*mu) - j0))
-			};
-			let i_magnitude = i.magnitude();
-			let j_magnitude = j.magnitude();
-			i.normalize_mut();
-			j.normalize_mut();
-			let mut k = i.cross(&j);
-			// From Rows:
-			cand.rotation = na::Matrix3::new(
-				i.x, i.y, i.z,
-				j.x, j.y, j.z,
-				k.x, k.y, k.z
-			);
-			let mean_candidate1_scale = (i_magnitude + j_magnitude) / 2.0;
-			let temp = cand.rotation * self.model_vectors[0]; // Mat3.multVector(rotation1, this.model[0]);
-			cand.translation.x = (camera_points[0].0 as f32 / mean_candidate1_scale) - temp[0];
-			cand.translation.y = (camera_points[0].1 as f32 / mean_candidate1_scale) - temp[1];
-			cand.translation.z = self.focal_length / mean_candidate1_scale;
-			cand.error = self.compute_pose_error(camera_points, &cand);
-		}
-	}
-
 	// Refines a pose and returns the delta error.
 	// If you need the error of the new pose, it's a member of the struct.
-	fn refine_pose(&self, points: &Vec<(u32, u32)>, pose: &mut MarkerPose) {
+	fn refine_pose(&self, points: &Vec<(f32, f32)>, pose: &mut MarkerPose) {
 		let mut previous_error = pose.error;
 		for _ in 0..MAX_POSE_ITERATIONS {
 			//assert!(!pose.error.is_nan());
@@ -276,7 +202,7 @@ impl PoseEstimator {
 			let mut new_c2 = pose.clone();
 
 			//self.pose_from_orthography_and_scaling(points, &mut new_epsilon, &mut new_c1, &mut new_c2);
-			self.pose_estimate(points, &mut new_c1, &mut new_c2);
+			self.make_initial_estimate(points, &mut new_c1, &mut new_c2);
 
 			if new_c1.error < new_c2.error {
 				*pose = new_c1;
@@ -292,7 +218,7 @@ impl PoseEstimator {
 
 	// Computes the error for the given pose and points but DOES NOT assign it to the marker.
 	// We shouldn't assign the error as this is called with the same marker a bunch to try and find the min error.
-	fn compute_pose_error(&self, points: &Vec<(u32, u32)>, pose: &MarkerPose) -> f32 {
+	fn compute_pose_error(&self, points: &Vec<(f32, f32)>, pose: &MarkerPose) -> f32 {
 		let reprojected_model = (0..4).map(|i| {
 			// Mulvector: eps = Vec3.addScalar( Vec3.multScalar( Mat3.multVector( this.modelVectors, rotation.row(2) ), 1.0 / translation.v[2]), 1.0);
 			let mut v: na::Vector3<f32> = matrix_vector_dot(&pose.rotation, &self.untransformed_marker_points[i]).add(&pose.translation);
@@ -337,10 +263,10 @@ fn make_marker_squares(size: f32) -> Vec<na::Vector3<f32>> {
 }
 
 /// Given ABC, compute the angle between AB and AC.  A is the corner.
-fn angle_points(a: &(u32, u32), b: &(u32, u32), c: &(u32, u32)) -> f32 {
-	let p = na::Vector3::new(a.0 as f32, a.1 as f32, 0.0f32);
-	let q = na::Vector3::new(b.0 as f32, b.1 as f32, 0.0f32);
-	let r = na::Vector3::new(c.0 as f32, c.1 as f32, 0.0f32);
+fn angle_points(a: &(f32, f32), b: &(f32, f32), c: &(f32, f32)) -> f32 {
+	let p = na::Vector3::new(a.0, a.1, 0.0f32);
+	let q = na::Vector3::new(b.0, b.1, 0.0f32);
+	let r = na::Vector3::new(c.0, c.1, 0.0f32);
 	angle(&p, &q, &r)
 }
 
@@ -421,7 +347,7 @@ mod tests {
 
 	#[test]
 	fn test_init() {
-		let pe = PoseEstimator::new(35.0, 320.0);
+		let pe = PoseEstimator::new((320, 240), 35.0, 320.0);
 		// Vectors internally should be (0,0), (35,0), (35,-35), (0,-35)
 		// Obj normal should be 0,0,-1
 		// Pseudoinverse should be 3x4
@@ -452,74 +378,49 @@ mod tests {
 	}
 
 	#[test]
-	fn test_known_offset1() {
+	fn test_known_pose() {
 		let corners = vec![
-			(
-				575,
-				156,
-			),
-			(
-				1344,
-				156,
-			),
-			(
-				1343,
-				924,
-			),
-			(
-				576,
-				924,
-			),
+			(116, 107),
+			(142, 105),
+			(143, 119),
+			(119, 121),
 		];
+		let marker_size_cm = 35f32; // Is this in mm or cm?
+		let focal_length_mm = 320f32;
+		let image_width = 320;
+		let image_height = 240;
 
-		let marker_size_cm = 40f32; // Is this in mm or cm?
-		let focal_length_mm = 35f32;
-		let sensor_width_mm = 35f32; // Yes, same as width.
-		let image_width = 1920;
-		let image_height = 1080;
-		let camera_transform_m = (0f32, 0f32, -1f32);
-		let camera_rotation_deg = (0.0, 0.0, 0.0);
+		// Corners should map to (-44, 13), (-18, 15), (-17, 1), (-41, -1)
+		// Image vectors: (0, 0), (26, 2), (27, -12), (3, -14)
+		let pe = PoseEstimator::new((image_width, image_height), marker_size_cm, focal_length_mm);
 
-		let pe = PoseEstimator::new(marker_size_cm, focal_length_mm);
+		/*
+		// Model normal should be (0, 0, -1)
+		assert!((pe.pseudoinverse - na::Matrix3x4::new(
+			0.0, 0.01904761904761905, 0.009523809523809518, -0.009523809523809528,
+			0.0, 0.009523809523809528, -0.009523809523809526, -0.019047619047619056,
+			0.0, 0.0, 0.0, 0.0
+		)).abs().sum() < 1e-5f32);
+		*/
 
 		let (c1, c2) = pe.estimate_marker_pose(&corners);
-		dbg!(&c1);
-		dbg!(&c2);
-	}
-
-	#[test]
-	fn test_known_offset2() {
-		let corners = vec![
-			(
-				813u32,
-				423,
-			),
-			(
-				1098,
-				453,
-			),
-			(
-				1071,
-				726,
-			),
-			(
-				769,
-				693,
-			),
-		];
-		let marker_size_cm = 40f32; // Is this in mm or cm?
-		let focal_length_mm = 35f32;
-		let sensor_width_mm = 35f32; // Yes, same as width.
-		let image_width = 1920;
-		let image_height = 1080;
-		let camera_transform_m = (0.141521, -0.959589, 2.41665);
-		let camera_rotation_deg = (22.76, -0.00019, 6.643);
-
-		let pe = PoseEstimator::new(marker_size_cm, focal_length_mm);
-
-		let (c1, c2) = pe.estimate_marker_pose(&corners);
-		dbg!(&c1);
-		dbg!(&c2);
+		assert!(c1.error <= c2.error);
+		// i0: 0.7238095238095237, -0.06666666666666665, 0
+		// j0: 0.05714285714285727, 0.40000000000000013, 0
+		let expected_rotation_1 = na::Matrix3::new(
+			0.995229155609543, -0.09166584327982631, -0.03341109098060741,
+			0.0785707228112799, 0.5499950596789582, 0.8314638151150369,
+			-0.05784089679136317, -0.830122164205087, 0.5545733703973112,
+		);
+		let expected_rotation_2 = na::Matrix3::new(
+			0.995229155609543, -0.09166584327982631, 0.03341109098060741,
+			0.0785707228112799, 0.5499950596789582, -0.8314638151150369,
+			0.05784089679136317,  0.830122164205087, 0.5545733703973112
+		);
+		let rotation_error_1 = (c1.rotation - expected_rotation_1).abs().sum();
+		let rotation_error_2 = (c2.rotation - expected_rotation_2).abs().sum();
+		assert!(rotation_error_1 < 1e-6);
+		assert!(rotation_error_2 < 1e-6);
 	}
 
 	#[test]
@@ -560,7 +461,7 @@ mod tests {
 
 		println!("Projected points to {}, {}, {}, {}.", &projected_a, &projected_b, &projected_c, &projected_d);
 
-		let pe = PoseEstimator::new(10.0, focal_length);
+		let pe = PoseEstimator::new((image_width as u32, image_height as u32),10.0, focal_length);
 		let marker_pts = vec![
 			(projected_a.x as u32, projected_a.y as u32),
 			(projected_b.x as u32, projected_b.y as u32),
