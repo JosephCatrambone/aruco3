@@ -27,23 +27,23 @@ pub struct MarkerPose {
 }
 
 impl MarkerPose {
-	fn apply_transform_to_points(&self, points: &Vec<(f32, f32, f32)>) -> Vec<(f32, f32, f32)> {
+	pub fn apply_transform_to_points(&self, points: &Vec<(f32, f32, f32)>) -> Vec<(f32, f32, f32)> {
 		let as_vec3 = points.iter().map(|p| { na::Vector3::new(p.0, p.1, p.2) }).collect();
 		self.apply_transform_to_vectors(&as_vec3).into_iter().map(|p| {(p.x, p.y, p.z)}).collect()
 	}
 
-	fn apply_transform_to_vectors(&self, points: &Vec<na::Vector3<f32>>) -> Vec<na::Vector3<f32>> {
+	pub fn apply_transform_to_vectors(&self, points: &Vec<na::Vector3<f32>>) -> Vec<na::Vector3<f32>> {
 		points.iter().map(|p| {
 			(self.rotation * p) + self.translation
 		}).collect()
 	}
 
-	fn apply_inverse_transform_to_points(&self, points: &Vec<(f32, f32, f32)>) -> Vec<(f32, f32, f32)> {
+	pub fn apply_inverse_transform_to_points(&self, points: &Vec<(f32, f32, f32)>) -> Vec<(f32, f32, f32)> {
 		let as_vec3 = points.iter().map(|p| { na::Vector3::new(p.0, p.1, p.2) }).collect();
 		self.apply_inverse_transform_to_vectors(&as_vec3).into_iter().map(|p| {(p.x, p.y, p.z)}).collect()
 	}
 
-	fn apply_inverse_transform_to_vectors(&self, points: &Vec<na::Vector3<f32>>) -> Vec<na::Vector3<f32>> {
+	pub fn apply_inverse_transform_to_vectors(&self, points: &Vec<na::Vector3<f32>>) -> Vec<na::Vector3<f32>> {
 		points.iter().map(|p| {
 			self.rotation.transpose() * (p - self.translation)
 		}).collect()
@@ -61,7 +61,7 @@ impl Default for MarkerPose {
 }
 
 impl PoseEstimator {
-	fn new(image_size: (u32, u32), marker_size: f32, focal_length: f32) -> Self {
+	pub fn new(image_size: (u32, u32), marker_size: f32, focal_length: f32) -> Self {
 		let original_frame = make_marker_squares(marker_size);
 		let mut model_vectors: na::Matrix4x3<f32> = na::Matrix4x3::new(
 			// Why can't we just make this from a list of rows!?  Isn't that the purpose of from_rows!?
@@ -216,37 +216,65 @@ impl PoseEstimator {
 	// Refines a pose and returns the delta error.
 	// If you need the error of the new pose, it's a member of the struct.
 	fn refine_estimate(&self, points: &Vec<(f32, f32)>, pose: &mut MarkerPose) {
+		// An overview of the algorithm as I understand it.  Take this with a grain of salt.
+		// Compute a projection of the marker points from the best known pose.
+		// If the estimate isn't improving, if the error is less than a pixel, or if we're out of iterations, return the best estimate.
+		// Compute new estimates from the new projected points.
+		// Evaluate moves towards the best pose, applying two possible rotations.  Keep the best of the two as the new best.
 		let mut previous_error = f32::MAX;
 		let mut previous_projected_points = points.clone();
 		let mut new_projected_points = points.clone();
 		let mut best_pose = pose.clone();
-		let mut candidate_1 = pose.clone();
-		let mut candidate_2 = pose.clone();
 
 		for _ in 0..self.max_refinement_iterations {
+
 			// We compare our new projected points to the absolute detected points, but our change in errors in each iteration is compared to the previous one to see if we plateau.
 			new_projected_points = points.iter().enumerate().map(|(idx, p)| {
 				let scale_factor = (self.model_vectors.row(idx) * best_pose.rotation.column(2).scale(1.0f32 / best_pose.translation.z)).x;
 				((1.0 + scale_factor) * p.0, (1.0 + scale_factor) * p.1)
 			}).collect::<Vec<(f32,f32)>>();
 			let delta_error: f32 = new_projected_points.iter().zip(&previous_projected_points).map(|(p_new, p_old)| { (p_new.0 - p_old.0).abs() + (p_new.1 - p_old.1).abs() }).sum();
-			if delta_error < 0.25 || previous_error == delta_error {
+			if delta_error < 0.25 || (previous_error - delta_error).abs() < 1e-5 {
 				// We are at the limits of the image resolution.  The 0.25 is rounding down on sqrt(pixel size).
+				// Or, alternatively, we're plateauing and can't get our error lower.
 				break;
 			}
-
-			// Tweak our point estimates to be closer to the best pose so far.
-			self.make_initial_estimate(&new_projected_points, &mut candidate_1, &mut candidate_2);
-			//let maybe_c1_error = self.compute_reprojected_pixel_and_euclidean_error(&points, &candidate_1);
-			//let maybe_c2_error = self.compute_reprojected_pixel_and_euclidean_error(&points, &candidate_2);
-			if candidate_1.error <= candidate_2.error {
-				best_pose = candidate_1.clone();
-			} else {
-				best_pose = candidate_2.clone();
-			}
-
 			previous_error = delta_error;
 			previous_projected_points = new_projected_points;
+
+			// Tweak our point estimates to be closer to the best pose so far.
+			let mut candidate_1 = MarkerPose::default();
+			let mut candidate_2 = MarkerPose::default();
+			self.make_initial_estimate(&previous_projected_points, &mut candidate_1, &mut candidate_2);
+			// Invert the rotation to get the marker into the 'neutral' pose and the invert the transform for the next poses.
+			// This is a little fuzzy for me.  Why are we _subtracting_?
+			candidate_1.translation = best_pose.translation - (candidate_1.rotation * self.untransformed_marker_points[0]);
+			candidate_2.translation = best_pose.translation - (candidate_2.rotation * self.untransformed_marker_points[0]);
+
+			let maybe_c1_error = self.compute_reprojected_pixel_and_euclidean_error(&points, &candidate_1);
+			let maybe_c2_error = self.compute_reprojected_pixel_and_euclidean_error(&points, &candidate_2);
+			if maybe_c1_error.is_some() && maybe_c2_error.is_some() {
+				let c1_error = maybe_c1_error.unwrap();
+				let c2_error = maybe_c2_error.unwrap();
+				if c1_error.1 <= c2_error.1 || c1_error.0 <= c2_error.0 {
+					best_pose = candidate_1.clone(); // TODO: This isn't a use-after
+				}
+			} else if maybe_c1_error.is_none() && maybe_c2_error.is_none() {
+				// We don't have valid estimates for either.
+				// Do we want to fail or use the alternative estimates?
+				eprintln!("Pose refinement failed. Both candidates were invalid. Aborting early.");
+				/*
+				if candidate_1.error <= candidate_2.error {
+					best_pose = candidate_1;
+				} else {
+					best_pose = candidate_2;
+				}
+				*/
+			} else if maybe_c1_error.is_some() {
+				best_pose = candidate_1;
+			} else {
+				best_pose = candidate_2;
+			}
 		}
 
 		*pose = best_pose;
