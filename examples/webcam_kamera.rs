@@ -1,10 +1,10 @@
 
-use aruco3::{ARDictionary, Detector, DetectorConfig};
+use aruco3::{ARDictionary, Detector, DetectorConfig, PoseEstimator};
 use imageproc;
 use image;
 use kamera::Camera;
 use minifb::{Key, Window, WindowOptions};
-use std::time::{Instant, Duration};
+use std::time::Instant;
 
 fn main() {
 	let camera = Camera::new_default_device();
@@ -19,6 +19,10 @@ fn main() {
 	// Read a starter frame:
 	let Some(frame) = camera.wait_for_frame() else { return }; // always blockingly waiting for next new frame
 	let (w, h) = frame.size_u32();
+
+	// Get pose estimator ready:
+	let mut pose_estimator = PoseEstimator::new((w, h), 0.04f32, 0.01f32); // 40mm markers
+	pose_estimator.max_refinement_iterations = 0;
 
 	// Allocate and open our window:
 	let mut window_buffer: Vec<u32> = vec![0; (w * h) as usize];
@@ -62,6 +66,14 @@ fn main() {
 			}
 		}
 
+		// Compute pose:
+		let marker_points = vec![(0.0, 0.0, 0.0f32), (1.0f32, 0.0, 0.0), (0.0, 1.0f32, 0.0), (0.0, 0.0, 1.0f32)];
+		for d in detections.markers.iter() {
+			let (pose1, _) = pose_estimator.estimate_marker_pose(&d.corners);
+			let unproj_pts = pose1.apply_transform_to_points(&marker_points);
+			draw_axes(&unproj_pts, &mut window_buffer, w, h);
+		}
+
 		window
 			.update_with_buffer(&window_buffer, w as usize, h as usize)
 			.expect("Failed to update window buffer.");
@@ -90,4 +102,11 @@ fn lazy_line(start: &(u32, u32), end: &(u32, u32), color: u32, buffer: &mut Vec<
 		px += dx;
 		py += dy;
 	}
+}
+
+fn draw_axes(axes: &Vec<(f32, f32, f32)>, buffer: &mut Vec<u32>, buffer_width: u32, buffer_height: u32) {
+	let to_u32 = |p: &(f32, f32, f32)| { (p.0.max(0.0) as u32, p.1.max(0.0) as u32) };
+	lazy_line(&to_u32(&axes[0]), &to_u32(&axes[1]), 0xFFFF0000, buffer, buffer_width, buffer_height);
+	lazy_line(&to_u32(&axes[0]), &to_u32(&axes[2]), 0xFF00FF00, buffer, buffer_width, buffer_height);
+	lazy_line(&to_u32(&axes[0]), &to_u32(&axes[3]), 0xFF0000FF, buffer, buffer_width, buffer_height);
 }

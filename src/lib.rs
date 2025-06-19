@@ -5,8 +5,9 @@ mod pinhole;
 
 pub use aruco::{Detector, DetectorConfig, Detection, Marker};
 pub use dictionaries::ARDictionary;
+pub use pose::{MarkerPose, PoseEstimator};
 
-pub fn hamming_distance(a: u64, b: u64) -> u8 {
+pub(crate) fn hamming_distance(a: u64, b: u64) -> u8 {
 	let mut flipped_bits = a ^ b;
 	let mut flip_count = 0u8;
 	while flipped_bits > 0 {

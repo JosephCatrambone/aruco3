@@ -13,6 +13,7 @@ rayon = { version = "1.10" }
 [dev-dependencies]
 # For benchmarking and debugging:
 ab_glyph = "*"
+derive_more = { version = "2", features = ["full"] }
 divan = "0.1.17"
 rand = "0.9"
 # For the webcam demo:
