@@ -204,12 +204,17 @@ fn discard_too_near(candidate_polygons: &mut Vec<Vec<Point<u32>>>, min_distance:
 			}
 			if (distance/4.0f32) < min_distance {
 				let perimeter_j = perimeter(&candidate_polygons[j]);
-				if perimeter_i >= perimeter_j {
-					dead_set.insert(j.clone());
-					indices_to_drop.push(j);
+				// Keep the bigger (non-dead) polygon.
+				if dead_set.contains(&i) || dead_set.contains(&j) {
+					// These polygons overlap closely, but i or j is going to be removed, so no worries.
 				} else {
-					dead_set.insert(i.clone());
-					indices_to_drop.push(i);
+					if perimeter_i >= perimeter_j {
+						dead_set.insert(j.clone());
+						indices_to_drop.push(j);
+					} else {
+						dead_set.insert(i.clone());
+						indices_to_drop.push(i);
+					}
 				}
 			}
 		}
