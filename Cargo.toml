@@ -21,6 +21,8 @@ minifb = "0.28"
 nokhwa = { version = "0.10.7", features = ["input-native", "output-threaded"] }
 kamera = "0.0.2"
 nalgebra-glm = "*"
+# For software rendering and camera alignment tests:
+macroquad = "0.4.14"
 
 [[bench]]
 name = "detect_markers"
