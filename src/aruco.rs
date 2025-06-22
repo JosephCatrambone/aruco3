@@ -12,6 +12,7 @@ pub struct Marker {
 	pub hamming_distance: u8,
 }
 
+#[derive(Default)]
 pub struct Detection {
 	pub grey: Option<GrayImage>,
 	pub candidates: Vec<Vec<Point<u32>>>,
@@ -187,6 +188,10 @@ fn discard_too_near(candidate_polygons: &mut Vec<Vec<Point<u32>>>, min_distance:
 	// If the mean (unaligned/uncorrected) distance between each pair of points is less than min_distance, pick the polygon with the bigger perimeter.
 	// NOTE: This doesn't work if one of the polygons is rotated.
 	// TODO: Handle polygon rotation case.
+	
+	if candidate_polygons.is_empty() {
+		return;
+	}
 
 	let mut dead_set = HashSet::new();
 	let mut indices_to_drop = vec![];
