@@ -84,14 +84,15 @@ fn make_marker_square(marker_size_mm: f32) -> Vec<na::Vector3<f32>> {
 
 /// Given an image size, computes the homography from an idealized 1x1 cube to the image points.
 fn compute_homography_from_marker_square(marker_size_mm: f32, target_points: &Vec<na::Vector2<f32>>) -> na::Matrix3<f32> {
-	let p1x = target_points[0].x;
-	let p1y = target_points[0].y;
-	let p2x = target_points[1].x;
-	let p2y = target_points[1].y;
-	let p3x = target_points[2].x;
-	let p3y = target_points[2].y;
-	let p4x = target_points[3].x;
-	let p4y = target_points[3].y;
+	// In the C++ implementation these are all inverted.
+	let p1x = -target_points[0].x;
+	let p1y = -target_points[0].y;
+	let p2x = -target_points[1].x;
+	let p2y = -target_points[1].y;
+	let p3x = -target_points[2].x;
+	let p3y = -target_points[2].y;
+	let p4x = -target_points[3].x;
+	let p4y = -target_points[3].y;
 
 	let half_width = marker_size_mm / 2.0;
 	let det_inv: f32 = -1.0f32 / (half_width * (p1x * p2y - p2x * p1y - p1x * p4y + p2x * p3y - p3x * p2y + p4x * p1y + p3x * p4y - p4x * p3y));
