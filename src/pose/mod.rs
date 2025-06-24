@@ -1,24 +1,6 @@
 use std::ops::{Add, Sub, Mul, Div};
 use nalgebra as na;
 
-const INITIAL_SVD_EPSILON: f32 = 1e-5;
-const INITIAL_SVD_MAX_ITER: usize = 100;
-const MAX_POSE_ITERATIONS: u32 = 100;
-
-// This is a separate structure because we need to compute the pseudoinverse of the points for a given marker size + focal dist.
-// It's faster to update a pose than to recompute it from scratch.
-#[derive(Debug)]
-pub struct PoseEstimator {
-	image_size: (u32, u32),
-	focal_length: f32,
-	marker_size: f32,
-	untransformed_marker_points: Vec<na::Vector3<f32>>,
-	model_vectors: na::Matrix4x3<f32>,
-	model_normal: na::Vector3<f32>,
-	pseudoinverse: na::Matrix3x4<f32>,
-	pub max_refinement_iterations: u32, // Unlike all the others, we can make this public because it doesn't require a recompute.
-}
-
 #[derive(Clone, Debug)]
 pub struct MarkerPose {
 	pub error: f32,
@@ -60,338 +42,296 @@ impl Default for MarkerPose {
 	}
 }
 
-impl PoseEstimator {
-	pub fn new(image_size: (u32, u32), marker_size: f32, focal_length: f32) -> Self {
-		let original_frame = make_marker_squares(marker_size);
-		let mut model_vectors: na::Matrix4x3<f32> = na::Matrix4x3::new(
-			// Why can't we just make this from a list of rows!?  Isn't that the purpose of from_rows!?
-			// na::RowVector3::from((original_frame[1] - original_frame[0]).into()),
-			0.0f32, 0.0f32, 0.0f32,
-			original_frame[1].x - original_frame[0].x, original_frame[1].y - original_frame[0].y, original_frame[1].z - original_frame[0].z,
-			original_frame[2].x - original_frame[0].x, original_frame[2].y - original_frame[0].y, original_frame[2].z - original_frame[0].z,
-			original_frame[3].x - original_frame[0].x, original_frame[3].y - original_frame[0].y, original_frame[3].z - original_frame[0].z,
-		);
+pub fn solve_ippe_square(image_size: (u32, u32), undistorted_points: &Vec<(u32, u32)>, marker_size_mm: f32) -> (MarkerPose, MarkerPose) {
+	let normalized_image_points = normalize_image_points(undistorted_points, image_size);
+	let object_points_2d = make_marker_square(marker_size_mm);
 
-		let pseudoinverse = model_vectors.pseudo_inverse(INITIAL_SVD_EPSILON).expect("Failed to compute initial pseudoinverse of model vectors. Is the focal distance real? Is the marker size nonzero?");
+	// Compute the homography from the marker square to the image points.
+	// Homography Matrix: [[x1], [y1], [1]] = H * [[x2], [y2], [1]]
+	// Both our world coordinates and our undistorted coordinates have zeros for their last row
+	// canonical_object_points_to_normalized_points_homography == homography
+	let homography = compute_homography_from_marker_square(marker_size_mm, &normalized_image_points);
 
-		let norm_from_svd = false;
-		let model_normal = if norm_from_svd {
-			// Double check this:
-			let svd: na::linalg::SVD<f32, na::U4, na::U3> = na::linalg::SVD::try_new(model_vectors, true, true, INITIAL_SVD_EPSILON, INITIAL_SVD_MAX_ITER).expect("Failed to compute initial decomposition for marker and vector. This can happen if marker size or focal length is zero.");
-			let v_t = svd.v_t.unwrap();
-			/*
-			// Since we need to compute the SVD anyway it's probably more efficient to use it to build the pseudoinverse, rather than compute it above.
-			let u = svd.u.unwrap();
-			let s_inverse = na::Matrix3::from_fn_generic(na::U3, na::U3, |i, j| {
-				if i != j || svd.singular_values[i].abs() < 1e-6 { 0.0 } else { 1.0 / svd.singular_values[i] }
-			});
-			//let pseudoinverse: na::Matrix3x4<f32> = u * s_inverse * v_t;
-			let pseudoinverse: na::Matrix3x4<f32> = v_t * s_inverse * u.transpose();
-			*/
+	let (pose1, pose2) = solve_canonical_form(&object_points_2d, &normalized_image_points, &homography);
 
-			// This was v.col(min_index) in the original, so it assumes that singular values are sorted.
-			// We're sorting greatest to smallest, so we need to take the _max_ column, which is the last one.
-			// Also since it's v_t we're grabbing a row.
-			// And since columns won't coerce to Vec3's, we do a transpose afterwards.
-			//let model_normal: na::Vector3<f32> = v_t.column(2).into();
-			let mut model_normal: na::Vector3<f32> = v_t.row(2).transpose();
-			model_normal
-		} else {
-			// I've seen this implemented in two ways: doing the cross and pulling from SVD:
-			// The model normal needs to be corrected so make sure the length is nonzero.
-			// We already use vec0 as an origin, so try crossing v1 with v2 and v1 with v3.
-			let candidate_normal_1 = model_vectors.row(1).cross(&model_vectors.row(2));
-			let candidate_normal_2 = model_vectors.row(1).cross(&model_vectors.row(3));
-			let mut model_normal: na::Vector3<f32> = if candidate_normal_1.magnitude() > 0.0f32 {
-				candidate_normal_1.transpose().into()
-			} else if candidate_normal_2.magnitude() > 0.0f32 {
-				candidate_normal_2.transpose().into()
-			} else {
-				panic!("Failed to get normal from marker: points may be degenerate. Is marker size nonzero? Are the points unique?");
-			};
-			model_normal.normalize_mut();
-			model_normal
-		};
-
-		Self {
-			image_size,
-			focal_length,
-			marker_size,
-			untransformed_marker_points: original_frame,
-			model_vectors,
-			model_normal,
-			pseudoinverse,
-			max_refinement_iterations: MAX_POSE_ITERATIONS,
-		}
-	}
-
-	pub fn estimate_marker_pose(&self, points: &Vec<(u32, u32)>) -> (MarkerPose, MarkerPose) {
-		// Recenter based on image size AND flip +y to be up:
-		let points: Vec<(f32, f32)> = points.iter().map(|p| { (p.0 as f32 - (self.image_size.0 as f32 * 0.5f32), (self.image_size.1 as f32 * 0.5f32) - p.1 as f32)  }).collect();
-
-		let mut candidate1 = MarkerPose::default();
-		let mut candidate2 = MarkerPose::default();
-
-		self.make_initial_estimate(&points, &mut candidate1, &mut candidate2);
-		self.refine_estimate(&points, &mut candidate1);
-		self.refine_estimate(&points, &mut candidate2);
-
-		if candidate1.error <= candidate2.error {
-			(candidate1, candidate2)
-		} else {
-			(candidate2, candidate1)
-		}
-	}
-
-	fn make_initial_estimate(&self, camera_points: &Vec<(f32, f32)>, cand1: &mut MarkerPose, cand2: &mut MarkerPose) {
-		//"Iterative Pose Estimation using Coplanar Feature Points" by Denis Oberkampf, Daniel F. DeMenthon, Larry S. Davis
-		// http://www.cfar.umd.edu/~daniel/daniel_papersfordownload/CoplanarPts.pdf
-
-		// Compute the image vectors, a set of points WRT the 0-th item (top left).
-		// We expect to have four, with the first being (0,0).
-		let marker_origin_x = camera_points[0].0;
-		let marker_origin_y = camera_points[0].1;
-		let mut image_vectors = Vec::<(f32, f32)>::with_capacity(4);
-		for i in 0usize..4 {
-			image_vectors.push((camera_points[i].0 as f32 - marker_origin_x, camera_points[i].1 as f32 - marker_origin_y));
-		}
-
-		let mut i0 = na::Vector3::new(0f32, 0f32, 0f32);
-		let mut j0 = na::Vector3::new(0f32, 0f32, 0f32);
-		for j in 0..4 {
-			i0.x += self.pseudoinverse.get((0,j)).unwrap() * image_vectors[j].0;
-			i0.y += self.pseudoinverse.get((1,j)).unwrap() * image_vectors[j].0;
-			i0.z += self.pseudoinverse.get((2,j)).unwrap() * image_vectors[j].0;
-			j0.x += self.pseudoinverse.get((0,j)).unwrap() * image_vectors[j].1;
-			j0.y += self.pseudoinverse.get((1,j)).unwrap() * image_vectors[j].1;
-			j0.z += self.pseudoinverse.get((2,j)).unwrap() * image_vectors[j].1;
-		}
-		let i0i0 = i0.dot(&i0);
-		let j0j0 = j0.dot(&j0);
-		let i0j0 = i0.dot(&j0);
-
-		let delta = (j0j0 - i0i0) * (j0j0 - i0i0) + 4.0 * (i0j0*i0j0);
-		let q = if j0j0 - i0i0 > 0.0 {
-			(j0j0 - i0i0 + delta.sqrt()) / 2.0
-		} else {
-			(j0j0 - i0i0 - delta.sqrt()) / 2.0
-		};
-
-		let mut lambda = 0.0;
-		let mut mu = 0.0;
-		if q >= 0.0 {
-			lambda = q.sqrt();
-			mu = if lambda.abs() < 1e-6 {
-				0.0
-			} else {
-				-i0j0 / lambda
-			};
-		} else {
-			lambda = (-(i0j0 * i0j0) / q).sqrt();
-			mu = if lambda.abs() < 1e-6 {
-				(i0i0 - j0j0).sqrt()
-			} else {
-				-i0j0 / lambda
-			};
-		}
-		let compute_rot = |out: &mut MarkerPose, lm_sign: f32| {
-			let ivec = i0 + self.model_normal.scale(lm_sign * lambda);
-			let jvec = j0 + self.model_normal.scale(lm_sign * mu);
-			let scale = ivec.magnitude(); // ivec.dot(&ivec).sqrt();
-			let row1 = ivec.scale(1.0 / scale);
-			let row2 = jvec.scale(1.0 / scale);
-			let row3 = row1.cross(&row2);
-			out.rotation.set_row(0, &row1.transpose());
-			out.rotation.set_row(1, &row2.transpose());
-			out.rotation.set_row(2, &row3.transpose());
-			out.translation.x = camera_points[0].0 as f32 / scale;
-			out.translation.y = camera_points[0].1 as f32 / scale;
-			out.translation.z = self.focal_length / scale;
-			out.error = self.compute_pose_error(camera_points, &out);
-		};
-		compute_rot(cand1, 1f32);
-		compute_rot(cand2, -1f32);
-	}
-
-	// Refines a pose and returns the delta error.
-	// If you need the error of the new pose, it's a member of the struct.
-	fn refine_estimate(&self, points: &Vec<(f32, f32)>, pose: &mut MarkerPose) {
-		// An overview of the algorithm as I understand it.  Take this with a grain of salt.
-		// Compute a projection of the marker points from the best known pose.
-		// If the estimate isn't improving, if the error is less than a pixel, or if we're out of iterations, return the best estimate.
-		// Compute new estimates from the new projected points.
-		// Evaluate moves towards the best pose, applying two possible rotations.  Keep the best of the two as the new best.
-		let mut previous_error = f32::MAX;
-		let mut previous_projected_points = points.clone();
-		let mut new_projected_points = points.clone();
-		let mut best_pose = pose.clone();
-
-		for _ in 0..self.max_refinement_iterations {
-
-			// We compare our new projected points to the absolute detected points, but our change in errors in each iteration is compared to the previous one to see if we plateau.
-			new_projected_points = points.iter().enumerate().map(|(idx, p)| {
-				let scale_factor = (self.model_vectors.row(idx) * best_pose.rotation.column(2).scale(1.0f32 / best_pose.translation.z)).x;
-				((1.0 + scale_factor) * p.0, (1.0 + scale_factor) * p.1)
-			}).collect::<Vec<(f32,f32)>>();
-			let delta_error: f32 = new_projected_points.iter().zip(&previous_projected_points).map(|(p_new, p_old)| { (p_new.0 - p_old.0).abs() + (p_new.1 - p_old.1).abs() }).sum();
-			if delta_error < 0.25 || (previous_error - delta_error).abs() < 1e-5 {
-				// We are at the limits of the image resolution.  The 0.25 is rounding down on sqrt(pixel size).
-				// Or, alternatively, we're plateauing and can't get our error lower.
-				break;
-			}
-			previous_error = delta_error;
-			previous_projected_points = new_projected_points;
-
-			// Tweak our point estimates to be closer to the best pose so far.
-			let mut candidate_1 = MarkerPose::default();
-			let mut candidate_2 = MarkerPose::default();
-			self.make_initial_estimate(&previous_projected_points, &mut candidate_1, &mut candidate_2);
-			// Invert the rotation to get the marker into the 'neutral' pose and the invert the transform for the next poses.
-			// This is a little fuzzy for me.  Why are we _subtracting_?
-			candidate_1.translation = best_pose.translation - (candidate_1.rotation * self.untransformed_marker_points[0]);
-			candidate_2.translation = best_pose.translation - (candidate_2.rotation * self.untransformed_marker_points[0]);
-
-			let maybe_c1_error = self.compute_reprojected_pixel_and_euclidean_error(&points, &candidate_1);
-			let maybe_c2_error = self.compute_reprojected_pixel_and_euclidean_error(&points, &candidate_2);
-			if maybe_c1_error.is_some() && maybe_c2_error.is_some() {
-				let c1_error = maybe_c1_error.unwrap();
-				let c2_error = maybe_c2_error.unwrap();
-				if c1_error.1 <= c2_error.1 || c1_error.0 <= c2_error.0 {
-					best_pose = candidate_1.clone(); // TODO: This isn't a use-after
-				}
-			} else if maybe_c1_error.is_none() && maybe_c2_error.is_none() {
-				// We don't have valid estimates for either.
-				// Do we want to fail or use the alternative estimates?
-				eprintln!("Pose refinement failed. Both candidates were invalid. Aborting early.");
-				/*
-				if candidate_1.error <= candidate_2.error {
-					best_pose = candidate_1;
-				} else {
-					best_pose = candidate_2;
-				}
-				*/
-			} else if maybe_c1_error.is_some() {
-				best_pose = candidate_1;
-			} else {
-				best_pose = candidate_2;
-			}
-		}
-
-		*pose = best_pose;
-	}
-
-	// Computes the error for the given pose and points but DOES NOT assign it to the marker.
-	// We shouldn't assign the error as this is called with the same marker a bunch to try and find the min error.
-	fn compute_pose_error(&self, points: &Vec<(f32, f32)>, pose: &MarkerPose) -> f32 {
-		let reprojected_model = (0..4).map(|i| {
-			// Mulvector: eps = Vec3.addScalar( Vec3.multScalar( Mat3.multVector( this.modelVectors, rotation.row(2) ), 1.0 / translation.v[2]), 1.0);
-			let mut v: na::Vector3<f32> = matrix_vector_dot(&pose.rotation, &self.untransformed_marker_points[i]).add(&pose.translation);
-			//let mut v: na::Vector3<f32> = matrix_vector_dot(&pose.rotation, &self.untransformed_marker_points[i]).scale(1.0f32 / pose.translation.z).add_scalar(1.0);
-			//let mut v: na::Vector3<f32> = pose.rotation.mul(&self.untransformed_marker_points[i]).add(pose.translation);
-			v *= self.focal_length / v.z;
-			v
-		}).collect::<Vec<na::Vector3<f32>>>();
-
-		let mut errors = 0.0;
-		for (idx_a, idx_b, idx_c) in [(0, 1, 3), (1, 2, 0), (2, 1, 3), (3, 0, 2)] {
-			let interior_angle = angle_points(&points[idx_a], &points[idx_b], &points[idx_c]);
-			let projected_angle = angle2d(&reprojected_model[idx_a], &reprojected_model[idx_b], &reprojected_model[idx_c]);
-			let angle_error = (interior_angle - projected_angle).abs() / 4.0;
-			errors += angle_error;
-		}
-		errors
-	}
-
-	// Given a set of subpixel points and a pose, reproject them into real space and return the estimated error
-	// in world space and in screen pixel space.  If the given pose is invalid or degenerate, returns None.
-	fn compute_reprojected_pixel_and_euclidean_error(&self, points: &Vec<(f32, f32)>, pose: &MarkerPose) -> Option<(u32, f32)> {
-		let mut pixel_error: u32 = 0;
-		let mut euclidean_error: f32 = 0.0;
-		// TODO: If this isn't valid, return None.
-		// return None;
-
-		// Start by moving the untransformed marker points according to the pose.
-		let mut transformed_marker_points = pose.apply_transform_to_vectors(&self.untransformed_marker_points);
-		if transformed_marker_points.iter().any(|p| { p.z.abs() < 1e-6f32 } ) { return None; } // Undefined.
-		transformed_marker_points.iter_mut().for_each(|p|{
-			p.x = self.focal_length * p.x / p.z;
-			p.y = self.focal_length * p.y / p.z;
-			p.z = self.focal_length * p.z / p.z;
-		});
-
-		for i in 0..4 {
-			let dx = points[i].0 as f32 - transformed_marker_points[i].x;
-			let dy = points[i].1 as f32 - transformed_marker_points[i].y;
-
-			pixel_error = dx.abs() as u32 + dy.abs() as u32;
-			euclidean_error = dx*dx + dy*dy;
-		}
-
-		Some((pixel_error, euclidean_error))
+	if pose1.error < pose2.error {
+		(pose1, pose2)
+	} else {
+		(pose2, pose1)
 	}
 }
 
-fn make_marker_squares(size: f32) -> Vec<na::Vector3<f32>> {
-	let hs = size/2.0f32;
-	// In screen space, -y is up and +x is right.
-	// In world space we're taking Z to be forward from the camera and +x to be right.
+/// Converts points from integer coordinates [0, width) and [0, height) to [0,1].
+fn normalize_image_points(undistorted_points: &Vec<(u32, u32)>, image_size: (u32, u32)) -> Vec<na::Vector2<f32>> {
+	undistorted_points.iter().map(|p| { na::Vector2::<f32>::new(p.0 as f32 / image_size.0 as f32, p.1 as f32 / image_size.1 as f32 ) }).collect()
+}
 
-	// (This one?) If +y is down and -x is left: lower left, lower right, upper right, upper left, counter-clockwise
-	// If +y is up and -x is left: upper left, upper right, lower right, lower left, clockwise
+fn unnormalize_points(points: &Vec<na::Vector2<f32>>, image_size: (u32, u32)) -> Vec<(u32, u32)> {
+	points.iter().map(|p| { ((p.x * image_size.0 as f32) as u32, (p.y * image_size.1 as f32) as u32) }).collect()
+}
+
+/// Generate four points, clockwise, starting from the top left, around the center with z=0.
+/// 'Up' is +Y, 'Right' is +X.
+fn make_marker_square(marker_size_mm: f32) -> Vec<na::Vector3<f32>> {
+	let hw = 0.5f32 * marker_size_mm;
 	vec![
-		na::Vector3::<f32>::new(-hs, hs, 0.0),
-		na::Vector3::<f32>::new(hs, hs, 0.0),
-		na::Vector3::<f32>::new(hs, -hs, 0.0),
-		na::Vector3::<f32>::new(-hs, -hs, 0.0),
+		na::Vector3::new(-hw, hw, 0.0),
+		na::Vector3::new(hw, hw, 0.0),
+		na::Vector3::new(hw, -hw, 0.0),
+		na::Vector3::new(-hw, -hw, 0.0),
 	]
 }
 
-/// Given ABC, compute the angle between AB and AC.  A is the corner.
-fn angle_points(a: &(f32, f32), b: &(f32, f32), c: &(f32, f32)) -> f32 {
-	let p = na::Vector3::new(a.0, a.1, 0.0f32);
-	let q = na::Vector3::new(b.0, b.1, 0.0f32);
-	let r = na::Vector3::new(c.0, c.1, 0.0f32);
-	angle(&p, &q, &r)
+/// Given an image size, computes the homography from an idealized 1x1 cube to the image points.
+fn compute_homography_from_marker_square(marker_size_mm: f32, target_points: &Vec<na::Vector2<f32>>) -> na::Matrix3<f32> {
+	let p1x = target_points[0].x;
+	let p1y = target_points[0].y;
+	let p2x = target_points[1].x;
+	let p2y = target_points[1].y;
+	let p3x = target_points[2].x;
+	let p3y = target_points[2].y;
+	let p4x = target_points[3].x;
+	let p4y = target_points[3].y;
+
+	let half_width = marker_size_mm / 2.0;
+	let det_inv: f32 = -1.0f32 / (half_width * (p1x * p2y - p2x * p1y - p1x * p4y + p2x * p3y - p3x * p2y + p4x * p1y + p3x * p4y - p4x * p3y));
+	let homography = na::Matrix3::new(
+		det_inv * (p1x * p3x * p2y - p2x * p3x * p1y - p1x * p4x * p2y + p2x * p4x * p1y - p1x * p3x * p4y + p1x * p4x * p3y + p2x * p3x * p4y - p2x * p4x * p3y), // 0,0
+		det_inv * (p1x * p2x * p3y - p1x * p3x * p2y - p1x * p2x * p4y + p2x * p4x * p1y + p1x * p3x * p4y - p3x * p4x * p1y - p2x * p4x * p3y + p3x * p4x * p2y), // 0,1
+		det_inv * half_width * (p1x * p2x * p3y - p2x * p3x * p1y - p1x * p2x * p4y + p1x * p4x * p2y - p1x * p4x * p3y + p3x * p4x * p1y + p2x * p3x * p4y - p3x * p4x * p2y), // 0,2
+		det_inv * (p1x * p2y * p3y - p2x * p1y * p3y - p1x * p2y * p4y + p2x * p1y * p4y - p3x * p1y * p4y + p4x * p1y * p3y + p3x * p2y * p4y - p4x * p2y * p3y), // 1,0
+		det_inv * (p2x * p1y * p3y - p3x * p1y * p2y - p1x * p2y * p4y + p4x * p1y * p2y + p1x * p3y * p4y - p4x * p1y * p3y - p2x * p3y * p4y + p3x * p2y * p4y), // 1,1
+		det_inv * half_width * (p1x * p2y * p3y - p3x * p1y * p2y - p2x * p1y * p4y + p4x * p1y * p2y - p1x * p3y * p4y + p3x * p1y * p4y + p2x * p3y * p4y - p4x * p2y * p3y), // 1,2
+		-det_inv * (p1x * p3y - p3x * p1y - p1x * p4y - p2x * p3y + p3x * p2y + p4x * p1y + p2x * p4y - p4x * p2y),
+		det_inv * (p1x * p2y - p2x * p1y - p1x * p3y + p3x * p1y + p2x * p4y - p4x * p2y - p3x * p4y + p4x * p3y), // 2,1
+		1.0f32,
+	);
+
+	homography
 }
 
-/// Drop the 'z' component from each vector and compute the 2D angle between AB and AC.
-fn angle2d(a: &na::Vector3<f32>, b: &na::Vector3<f32>, c: &na::Vector3<f32>) -> f32 {
-	let p = na::Vector3::new(a.x, a.y, 0.0);
-	let q = na::Vector3::new(b.x, b.y, 0.0);
-	let r = na::Vector3::new(c.x, c.y, 0.0);
-	angle(&p, &q, &r)
+/// Compute the jacobian of the homography (which maps an idealized real marker to image points),
+/// then use that jacobian to refine said homography into real pose data.
+/// Input: the idealized corners of a marker at z=0, clockwise from top-left.
+/// Output: two possible poses.
+/// 'canonical points' are just points centered at zero with z=0. If we generate the marker points this satisfies the constraint.
+fn solve_canonical_form(object_points_2d: &Vec<na::Vector3<f32>>, normalized_image_points: &Vec<na::Vector2<f32>>, h: &na::Matrix3<f32>) -> (MarkerPose, MarkerPose) {
+	// TODO: Verify this isn't transposed AND the order of operations isn't messing it up.
+	let jacobian = na::Matrix2::<f32>::new(
+		h.m11 - h.m31 * h.m13, h.m12 - h.m32 * h.m13,
+		h.m21 - h.m31 * h.m23, h.m22 - h.m32 * h.m23,
+	);
+
+	// The homography's third column has a transform of 0,0 into the image plane.
+	let translation = na::Vector2::new(h.m13, h.m23);
+
+	let mut pose1 = MarkerPose::default();
+	let mut pose2 = MarkerPose::default();
+
+	let (rot1, rot2) = compute_rotations(&jacobian, translation.x, translation.y);
+
+	let tx1 = compute_translation(object_points_2d, normalized_image_points, &rot1);
+	let tx2 = compute_translation(object_points_2d, normalized_image_points, &rot2);
+
+	pose1.rotation = rot1;
+	pose1.translation = tx1;
+	pose2.rotation = rot2;
+	pose2.translation = tx2;
+
+	pose1.error = compute_reprojection_error(&pose1, object_points_2d, normalized_image_points);
+	pose2.error = compute_reprojection_error(&pose2, object_points_2d, normalized_image_points);
+
+	(pose1, pose2)
 }
 
-/// Compute the angle between lines AB and AC.
-fn angle(a: &na::Vector3<f32>, b: &na::Vector3<f32>, c: &na::Vector3<f32>) -> f32 {
-	// a dot b = ||a|| * ||b|| * cos(theta)
-	//fn angle<D, M>(a: &M, b: &M, c: &M) -> f32 where M: na::Matrix<f32, U1, D, na::ArrayStorage<f32, 1, D>> {
-	// It would be really nice to make this generic over Vector.
-	let mut p = b-a;
-	let mut q = c-a;
-	let pmag = p.magnitude();
-	let qmag = q.magnitude();
-	let dot = p.dot(&q);
-	let normalized_dot = dot / (pmag * qmag);
-	#[cfg(debug_assertions)]
-	if normalized_dot.is_infinite() || normalized_dot.is_nan() || normalized_dot < -1.1f32 || normalized_dot > 1.1f32 {
-		eprintln!("angle() called with bad numerical values: {}, {}, {}", &a, &b, &c);
-		eprintln!("Normalized Dot: {}\nInfinite: {}\nNormalized is NaN: {}\nNormalized dot < -1.0: {}\nNormalized dot > 1.0: {}", normalized_dot, normalized_dot.is_infinite(), normalized_dot.is_nan(), normalized_dot < -1.0, normalized_dot > 1.0);
+fn compute_rotations(jacobian: &na::Matrix2<f32>, tx: f32, ty: f32) -> (na::Matrix3<f32>, na::Matrix3<f32>) {
+	// Begin weeping openly.
+	let translation = na::Vector3::new(
+		tx,
+		ty,
+		1.0
+	);
+
+	let rv = find_rotation_to_z(&translation).transpose();
+
+	// Closed-form 3x3 SVD?:
+	let b00 = rv.m11 - tx * rv.m31;
+	let b01 = rv.m12 - tx * rv.m32;
+	let b10 = rv.m21 - ty * rv.m31;
+	let b11 = rv.m22 - ty * rv.m32;
+
+	let inv_det = 1.0 / (b00 * b11 - b01 * b10); // dtinv = 1.0 / ((b00 * b11 - b01 * b10));
+	let binv00 = inv_det * b11;
+	let binv01 = -inv_det * b01;
+	let binv10 = -inv_det * b10;
+	let binv11 = inv_det * b00;
+
+	let a00 = binv00 * jacobian.m11 + binv01 * jacobian.m21;
+	let a01 = binv00 * jacobian.m12 + binv01 * jacobian.m22;
+	let a10 = binv10 * jacobian.m11 + binv11 * jacobian.m21;
+	let a11 = binv10 * jacobian.m12 + binv11 * jacobian.m22;
+
+	// Largest singular value of A:
+	let ata00 = a00 * a00 + a01 * a01;
+	let ata01 = a00 * a10 + a01 * a11;
+	let ata11 = a10 * a10 + a11 * a11;
+
+	let gamma = (0.5 * (ata00 + ata11 + ((ata00 - ata11) * (ata00 - ata11) + 4.0 * ata01 * ata01).sqrt())).sqrt();
+
+	// Reconstruct rot matrices:
+	let rtilde00 = a00 / gamma;
+	let rtilde01 = a01 / gamma;
+	let rtilde10 = a10 / gamma;
+	let rtilde11 = a11 / gamma;
+
+	let rtilde00_2 = rtilde00 * rtilde00;
+	let rtilde01_2 = rtilde01 * rtilde01;
+	let rtilde10_2 = rtilde10 * rtilde10;
+	let rtilde11_2 = rtilde11 * rtilde11;
+
+	let b0 = (-rtilde00_2 - rtilde10_2 + 1.0).sqrt();
+	let mut b1 = (-rtilde01_2 - rtilde11_2 + 1.0).sqrt();
+	let sp = -rtilde00 * rtilde01 - rtilde10 * rtilde11;
+
+	if sp < 0.0 {
+		b1 = -b1;
 	}
-	normalized_dot.max(-1.0).min(1.0).acos()
+
+	let r1 = na::Matrix3::new(
+		(rtilde00)*rv.m11 + (rtilde10)*rv.m12 + (b0)*rv.m13,
+		(rtilde01)*rv.m11 + (rtilde11)*rv.m12 + (b1)*rv.m13,
+		(b1 * rtilde10 - b0 * rtilde11) * rv.m11 + (b0 * rtilde01 - b1 * rtilde00) * rv.m12 + (rtilde00 * rtilde11 - rtilde01 * rtilde10) * rv.m13,
+		(rtilde00)*rv.m21 + (rtilde10)*rv.m22 + (b0)*rv.m23,
+		(rtilde01)*rv.m21 + (rtilde11)*rv.m22 + (b1)*rv.m23,
+		(b1 * rtilde10 - b0 * rtilde11) * rv.m21 + (b0 * rtilde01 - b1 * rtilde00) * rv.m22 + (rtilde00 * rtilde11 - rtilde01 * rtilde10) * rv.m23,
+		(rtilde00)*rv.m31 + (rtilde10)*rv.m32 + (b0)*rv.m33,
+		(rtilde01)*rv.m31 + (rtilde11)*rv.m32 + (b1)*rv.m33,
+		(b1 * rtilde10 - b0 * rtilde11) * rv.m31 + (b0 * rtilde01 - b1 * rtilde00) * rv.m32 + (rtilde00 * rtilde11 - rtilde01 * rtilde10) * rv.m33,
+	);
+	let r2 = na::Matrix3::new(
+		(rtilde00)*rv.m11 + (rtilde10)*rv.m12 + (-b0) * rv.m13,
+		(rtilde01)*rv.m11 + (rtilde11)*rv.m12 + (-b1) * rv.m13,
+		(b0 * rtilde11 - b1 * rtilde10) * rv.m11 + (b1 * rtilde00 - b0 * rtilde01) * rv.m12 + (rtilde00 * rtilde11 - rtilde01 * rtilde10) * rv.m13,
+		(rtilde00)*rv.m21 + (rtilde10)*rv.m22 + (-b0) * rv.m23,
+		(rtilde01)*rv.m21 + (rtilde11)*rv.m22 + (-b1) * rv.m23,
+		(b0 * rtilde11 - b1 * rtilde10) * rv.m21 + (b1 * rtilde00 - b0 * rtilde01) * rv.m22 + (rtilde00 * rtilde11 - rtilde01 * rtilde10) * rv.m23,
+		(rtilde00)*rv.m31 + (rtilde10)*rv.m32 + (-b0) * rv.m33,
+		(rtilde01)*rv.m31 + (rtilde11)*rv.m32 + (-b1) * rv.m33,
+		(b0 * rtilde11 - b1 * rtilde10) * rv.m31 + (b1 * rtilde00 - b0 * rtilde01) * rv.m32 + (rtilde00 * rtilde11 - rtilde01 * rtilde10) * rv.m33,
+	);
+
+	(r1, r2)
 }
 
-/// Computes a new vec3 from the dot product of each matrix row with the given vector.
-/// Equivalent to v @ M^T, but returns a vector.
-fn matrix_vector_dot(mat: &na::Matrix3<f32>, v: &na::Vector3<f32>) -> na::Vector3<f32> {
-	let mt = mat.transpose();
+/// Find the rotation that, when applied to vec, will align it with <0, 0, 1>.
+fn find_rotation_to_z(vec: &na::Vector3<f32>) -> na::Matrix3<f32> {
+	let mut rot = na::Matrix3::<f32>::zeros();
+	let vec = vec.normalize();
+	let ax = vec.x;
+	let ay = vec.y;
+	let az = vec.z;
+
+	if (1.0+az).abs() < 1e-6 {
+		// We have a potential numerical stability issue.
+		rot.m11 = 1.0;
+		rot.m22 = 1.0;
+		rot.m33 = -1.0;
+	} else {
+		let d = 1.0 / (1.0+az);
+		let ax2 = ax*ax;
+		let ay2 = ay*ay;
+		let axay = ax*ay;
+		rot.m11 = -ax2*d + 1.0;
+		rot.m12 = -axay*d;
+		rot.m13 = -ax;
+		rot.m21 = -axay*d;
+		rot.m22 = -ay2*d + 1.0;
+		rot.m23 = -ay;
+		rot.m31 = ax;
+		rot.m32 = ay;
+		rot.m33 = 1.0 - (ax2+ay2)*d;
+	}
+
+	rot
+}
+
+fn compute_translation(object_points_2d: &Vec<na::Vector3<f32>>, normalized_image_points: &Vec<na::Vector2<f32>>, rot: &na::Matrix3<f32>) -> na::Vector3<f32> {
+	// This is solved by building the linear system At = b, where t corresponds to the (unknown) translation.
+	// This is then inverted with the associated normal equations to give t = inv(transpose(A)*A)*transpose(A)*b
+	// For efficiency we only store the coefficients of (transpose(A)*A) and (transpose(A)*b)
+	let n = 3*object_points_2d.len();
+
+	// Coefficients of A.T * A 
+	let mut ata = na::Matrix3::new(
+		n as f32, 0.0, 0.0,
+		0f32, n as f32, 0f32,
+		0f32, 0f32, 0f32
+	);
+
+	let mut atb0 = 0f32;
+	let mut atb1 = 0f32;
+	let mut atb2 = 0f32;
+
+	//now loop through each point and increment the coefficients:
+	for i in 0..n {
+		let rx = rot.m11 * object_points_2d[i].x + rot.m12 * object_points_2d[i].y;
+		let ry = rot.m21 * object_points_2d[i].x + rot.m22 * object_points_2d[i].y;
+		let rz = rot.m31 * object_points_2d[i].x + rot.m32 * object_points_2d[i].y;
+
+		let a2 = -normalized_image_points[i].x;
+		let b2 = -normalized_image_points[i].y;
+
+		ata.m13 += a2;
+		ata.m23 += b2;
+		ata.m31 += a2;
+		ata.m32 += b2;
+		ata.m33 += a2*a2 + b2*b2;
+
+		let bx = -a2 * rz - rx;
+		let by = -b2 * rz - ry;
+
+		atb0 += bx;
+		atb1 += by;
+		atb2 += a2 * bx + b2 * by;
+	}
+
+	//let det_a_inv = 1.0 / (ATA00 * ATA11 * ATA22 - ATA00 * ATA12 * ATA21 - ATA02 * ATA11 * ATA20);
+	let det_a_inv = 1.0 / ata.determinant();
+
+	// (A.T * A).inv() / A.det().pow(2)
+	// Do we want to do this with matmuls or long form?
+	let s = na::Matrix3::new(
+		ata.m22 * ata.m33 - ata.m23 * ata.m32,
+		ata.m13 * ata.m32,
+		-ata.m13 * ata.m22,
+		ata.m23 * ata.m31,
+		ata.m11 * ata.m33 - ata.m13 * ata.m31,
+		-ata.m11 * ata.m23,
+		-ata.m22 * ata.m31,
+		-ata.m11 * ata.m32,
+		ata.m11 * ata.m22,
+	);
+
+	// Solve t:
 	na::Vector3::new(
-		mt.column(0).dot(v),
-		mt.column(0).dot(v),
-		mt.column(0).dot(v),
+		det_a_inv * (s.m11 * atb0 + s.m12 * atb1 + s.m13 * atb2),
+		det_a_inv * (s.m21 * atb0 + s.m22 * atb1 + s.m23 * atb2),
+		det_a_inv * (s.m31 * atb0 + s.m32 * atb1 + s.m33 * atb2),
 	)
 }
 
+fn compute_reprojection_error(pose: &MarkerPose, object_points_2d: &Vec<na::Vector3<f32>>, normalized_image_points: &Vec<na::Vector2<f32>>) -> f32 {
+	let projected = pose.apply_transform_to_vectors(object_points_2d);
+	let mut error = 0f32;
+
+	for i in 0..normalized_image_points.len() {
+		let dx = (projected[i].x / projected[i].z.max(1e-5)) - normalized_image_points[i].x;
+		let dy = (projected[i].y / projected[i].z.max(1e-5)) - normalized_image_points[i].y;
+		error += (dx*dx + dy*dy).sqrt();
+	}
+
+	error
+}
 
 #[cfg(test)]
 mod tests {
@@ -399,36 +339,6 @@ mod tests {
 	use nalgebra as na;
 	use std::f32::consts::PI;
 	use rand::{rng, Rng};
-
-	#[test]
-	fn test_cos_angle() {
-		// TODO: Could use better tests, but...
-		let mut a = na::Vector3::new(1.0, 0.0, 0.0);
-		let mut b = na::Vector3::new(1.0, 0.0, 1.0);
-		let mut c = na::Vector3::new(1.0, 1.0, 0.0);
-		assert_eq!(angle(&a, &b, &c), std::f32::consts::PI/2.0);
-
-		for i in 0..10 {
-			a.x = i as f32;
-			b.x = a.x;
-			c.x = a.x;
-			assert_eq!(angle(&a, &b, &c), std::f32::consts::PI/2.0);
-		}
-	}
-
-	#[test]
-	fn test_cos_angle_domain() {
-		// From a bug where we got stuff out of range which caused all kinds of problems.
-		let mut a = na::Vector3::new(813.0, 423.0, 0.0);
-		let mut b = na::Vector3::new(1095.0, 453.0, 1.0);
-		let mut c = na::Vector3::new(769.0, 693.0, 0.0);
-		assert!(!angle(&a, &b, &c).is_nan());
-
-		a = na::Vector3::new(-5896.0, -2020.6613, 0.0);
-		b = na::Vector3::new(4.2192984, 24.331556, 0.0);
-		c = na::Vector3::new(66.10354, 45.78034, 0.0);
-		assert!(!angle(&a, &b, &c).is_nan());
-	}
 
 	#[test]
 	fn test_marker_transforms() {
@@ -490,148 +400,5 @@ mod tests {
 		}
 		println!("Total Tests: {tests} \n Total Error: {total_error} \n Biggest Error: {max_error} \n Failures: {failures}");
 		assert_eq!(failures, 0);
-	}
-
-	#[test]
-	fn test_init() {
-		let pe = PoseEstimator::new((320, 240), 35.0, 320.0);
-		// Vectors internally should be (0,0), (35,0), (35,-35), (0,-35)
-		// Obj normal should be 0,0,-1
-		// Pseudoinverse should be 3x4
-		/*
-		0: (4) […]
-			0: -4.186041222059461e-19
-			1: 0.01904761904761905
-			2: 0.009523809523809518
-			3: -0.009523809523809528
-		1: (4) […]
-			0: -8.37208244411892e-19
-			1: 0.009523809523809528
-			2: -0.009523809523809526
-			3: -0.019047619047619056
-		2: (4) […]
-			0: 0
-			1: 0
-			2: 0
-			3: 0
-		*/
-		assert!(pe.model_normal.x.abs() < 1e-6f32 && pe.model_normal.y.abs() < 1e-6f32 && (pe.model_normal.z - -1f32).abs() < 1e-6);
-		assert_eq!(&pe.pseudoinverse.shape(), &(3usize, 4usize));
-		assert!((pe.pseudoinverse - na::Matrix3x4::new(
-			0.0, 0.01904761904761905, 0.009523809523809518, -0.009523809523809528,
-			0.0, 0.009523809523809528, -0.009523809523809526, -0.019047619047619056,
-			0.0, 0.0, 0.0, 0.0
-		)).abs().sum() < 1e-5f32);
-	}
-
-	#[test]
-	fn test_known_pose() {
-		let corners = vec![
-			(116, 107),
-			(142, 105),
-			(143, 119),
-			(119, 121),
-		];
-		let marker_size_cm = 35f32; // Is this in mm or cm?
-		let focal_length_mm = 320f32;
-		let image_width = 320;
-		let image_height = 240;
-
-		// Corners should map to (-44, 13), (-18, 15), (-17, 1), (-41, -1)
-		// Image vectors: (0, 0), (26, 2), (27, -12), (3, -14)
-		let mut pe = PoseEstimator::new((image_width, image_height), marker_size_cm, focal_length_mm);
-		pe.max_refinement_iterations = 0;
-
-		/*
-		// Model normal should be (0, 0, -1)
-		assert!((pe.pseudoinverse - na::Matrix3x4::new(
-			0.0, 0.01904761904761905, 0.009523809523809518, -0.009523809523809528,
-			0.0, 0.009523809523809528, -0.009523809523809526, -0.019047619047619056,
-			0.0, 0.0, 0.0, 0.0
-		)).abs().sum() < 1e-5f32);
-		*/
-
-		let (c1, c2) = pe.estimate_marker_pose(&corners);
-		assert!(c1.error <= c2.error);
-		// i0: 0.7238095238095237, -0.06666666666666665, 0
-		// j0: 0.05714285714285727, 0.40000000000000013, 0
-		let expected_translation = na::Vector3::new(-60.49945656468538, 17.874839439566134, 439.9960477431664);
-		let expected_rotation_1 = na::Matrix3::new(
-			0.995229155609543, -0.09166584327982631, -0.03341109098060741,
-			0.0785707228112799, 0.5499950596789582, 0.8314638151150369,
-			-0.05784089679136317, -0.830122164205087, 0.5545733703973112,
-		);
-		let expected_rotation_2 = na::Matrix3::new(
-			0.995229155609543, -0.09166584327982631, 0.03341109098060741,
-			0.0785707228112799, 0.5499950596789582, -0.8314638151150369,
-			0.05784089679136317,  0.830122164205087, 0.5545733703973112
-		);
-		let rotation_error_1 = (c1.rotation - expected_rotation_1).abs().sum();
-		let rotation_error_2 = (c2.rotation - expected_rotation_2).abs().sum();
-		let translation_error_1 = (c1.translation - expected_translation).abs().sum();
-		let translation_error_2 = (c2.translation - expected_translation).abs().sum();
-		assert!(rotation_error_1 < 1e-6);
-		assert!(rotation_error_2 < 1e-6);
-		assert!(translation_error_1 < 1e-3);
-		assert!(translation_error_2 < 1e-3);
-
-		pe.max_refinement_iterations = 100;
-		let (c1, c2) = pe.estimate_marker_pose(&corners);
-	}
-
-	#[test]
-	fn test_planar_translations() {
-		use nalgebra as na;
-		use nalgebra_glm as glm;
-
-		let FOV = PI / 2.0f32;
-		let focal_length = 1.0f32;// /(FOV/2.0f32).tan(); // FOV = 2*arctan(sensor_size/2*focal_length) -> tan(FOV/2) = sensor_size/(2*focal_len) -> (2*focal_len)*tan(FOV/2) = sensor_size -> 2*focal_len = sensor_size/tan(FOV/2)
-		let image_width = 640f32;
-		let image_height = 480f32;
-		let camera_position = glm::vec3(0f32, 0f32, -10f32);
-
-		// Four points sitting upright with +y up and +x right.
-		// Lower left is at the origin.
-		let marker_ll = glm::vec3(0.0f32, 0.0f32, 0.0f32);
-		let marker_lr = glm::vec3(0.1f32, 0.0f32, 0.0f32);
-		let marker_ur = glm::vec3(0.1f32, 0.1f32, 0.0f32);
-		let marker_ul = glm::vec3(0.0f32, 0.1f32, 0.0f32);
-		//glm::project_no()
-
-		// [Model Coords] -(model matrix)-> [World Coordinates] -(view matrix)-> [Camera Coordinates] -(projection matrix)-> [Homogeneous Coordinates]
-		// Model-View matrix positions the camera in OpenGL (generally via look-at).
-
-		// Stick with OpenGL +y up left-handed.
-		let mvm = glm::look_at_lh(&camera_position, &[0f32, 0f32, 0f32].into(), &[0f32, 1f32, 0f32].into());
-		let projm = glm::perspective_fov_lh_no(PI / 2.0f32, image_width, image_height, 1.0f32, 100f32);
-		let viewport = glm::vec4(0.0f32, 0.0f32, image_width, image_height); // Lower left, upper right, XY, WH.
-		// Ordering for projection is UL, UR, LR, LL
-		let mut projected_a = glm::project_no(&marker_ul, &mvm, &projm, viewport.clone());
-		let mut projected_b = glm::project_no(&marker_ur, &mvm, &projm, viewport.clone());
-		let mut projected_c = glm::project_no(&marker_lr, &mvm, &projm, viewport.clone());
-		let mut projected_d = glm::project_no(&marker_ll, &mvm, &projm, viewport.clone());
-		projected_a /= projected_a.z;
-		projected_b /= projected_b.z;
-		projected_c /= projected_c.z;
-		projected_d /= projected_d.z;
-
-		println!("Projected points to {}, {}, {}, {}.", &projected_a, &projected_b, &projected_c, &projected_d);
-
-		let pe = PoseEstimator::new((image_width as u32, image_height as u32),10.0, focal_length);
-		let marker_pts = vec![
-			(projected_a.x as u32, projected_a.y as u32),
-			(projected_b.x as u32, projected_b.y as u32),
-			(projected_c.x as u32, projected_c.y as u32),
-			(projected_d.x as u32, projected_d.y as u32),
-		];
-
-		let (c1, c2) = pe.estimate_marker_pose(&marker_pts);
-		dbg!(&c1);
-		dbg!(&c2);
-
-		//let camera = na::Perspective3::new(1.0f32, 1.0, 1.0, 100.0).as_matrix();
-		//let centered_points = make_marker_squares(10.0f32);
-		//let transformed_points = centered_points.iter().map(|p| { na::Matrix1x3::from(p.sub(&c1.translation).transpose()).mul(&c1.rotation.transpose()) }).collect::<Vec<na::Matrix1x3<f32>>>();
-		//dbg!(transformed_points);
 	}
 }
