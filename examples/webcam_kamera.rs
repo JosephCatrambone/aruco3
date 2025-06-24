@@ -1,5 +1,5 @@
 
-use aruco3::{ARDictionary, Detector, DetectorConfig, PoseEstimator};
+use aruco3::{ARDictionary, Detector, DetectorConfig, estimate_pose};
 use imageproc;
 use image;
 use kamera::Camera;
@@ -12,17 +12,13 @@ fn main() {
 
 	// Get our detector ready:
 	let detector = Detector {
-		config: Default::default(),
+		config: DetectorConfig::default(),
 		dictionary: ARDictionary::new_from_named_dict("ARUCO"),
 	};
 
 	// Read a starter frame:
 	let Some(frame) = camera.wait_for_frame() else { return }; // always blockingly waiting for next new frame
 	let (w, h) = frame.size_u32();
-
-	// Get pose estimator ready:
-	let mut pose_estimator = PoseEstimator::new((w, h), 0.04f32, 0.01f32); // 40mm markers
-	pose_estimator.max_refinement_iterations = 0;
 
 	// Allocate and open our window:
 	let mut window_buffer: Vec<u32> = vec![0; (w * h) as usize];
@@ -69,7 +65,7 @@ fn main() {
 		// Compute pose:
 		let marker_points = vec![(0.0, 0.0, 0.0f32), (1.0f32, 0.0, 0.0), (0.0, 1.0f32, 0.0), (0.0, 0.0, 1.0f32)];
 		for d in detections.markers.iter() {
-			let (pose1, _) = pose_estimator.estimate_marker_pose(&d.corners);
+			let (pose1, _) = estimate_pose((w, h), &d.corners, 10.0f32);
 			let unproj_pts = pose1.apply_transform_to_points(&marker_points);
 			draw_axes(&unproj_pts, &mut window_buffer, w, h);
 		}

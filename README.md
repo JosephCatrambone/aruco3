@@ -1,6 +1,6 @@
 # RS-Aruco3 
 A pure Rust implementation of Aruco and AprilTag detection/pose estimation.
-Ported from the excellent https://github.com/damianofalcioni/js-aruco2 library.
+Ported from the excellent https://github.com/damianofalcioni/js-aruco2 library and using a lightly modified version of the IPPE algorithm as implemented in https://github.com/tobycollins/IPPE.
 
 Detection and quad estimation work well.  Pose estimation is broken, but I will continue to pour my rapidly dwindling sanity into it to find a solution.
 

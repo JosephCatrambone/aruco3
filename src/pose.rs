@@ -273,7 +273,7 @@ fn compute_translation(object_points_2d: &Vec<na::Vector3<f32>>, normalized_imag
 	let mut atb2 = 0f32;
 
 	//now loop through each point and increment the coefficients:
-	for i in 0..n {
+	for i in 0..4 {
 		let rx = rot.m11 * object_points_2d[i].x + rot.m12 * object_points_2d[i].y;
 		let ry = rot.m21 * object_points_2d[i].x + rot.m22 * object_points_2d[i].y;
 		let rz = rot.m31 * object_points_2d[i].x + rot.m32 * object_points_2d[i].y;
@@ -295,8 +295,8 @@ fn compute_translation(object_points_2d: &Vec<na::Vector3<f32>>, normalized_imag
 		atb2 += a2 * bx + b2 * by;
 	}
 
-	//let det_a_inv = 1.0 / (ATA00 * ATA11 * ATA22 - ATA00 * ATA12 * ATA21 - ATA02 * ATA11 * ATA20);
-	let det_a_inv = 1.0 / ata.determinant();
+	let det_a_inv = 1.0 / (ata.m11 * ata.m22 * ata.m33 - ata.m11 * ata.m23 * ata.m32 - ata.m13 * ata.m22 * ata.m31);
+	//let det_a_inv = 1.0 / ata.determinant();
 
 	// (A.T * A).inv() / A.det().pow(2)
 	// Do we want to do this with matmuls or long form?
