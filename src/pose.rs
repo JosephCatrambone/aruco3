@@ -117,7 +117,6 @@ fn compute_homography_from_marker_square(marker_size_mm: f32, target_points: &Ve
 /// Output: two possible poses.
 /// 'canonical points' are just points centered at zero with z=0. If we generate the marker points this satisfies the constraint.
 fn solve_canonical_form(object_points_2d: &Vec<na::Vector3<f32>>, normalized_image_points: &Vec<na::Vector2<f32>>, h: &na::Matrix3<f32>) -> (MarkerPose, MarkerPose) {
-	// TODO: Verify this isn't transposed AND the order of operations isn't messing it up.
 	let jacobian = na::Matrix2::<f32>::new(
 		h.m11 - h.m31 * h.m13, h.m12 - h.m32 * h.m13,
 		h.m21 - h.m31 * h.m23, h.m22 - h.m32 * h.m23,
@@ -260,12 +259,11 @@ fn compute_translation(object_points_2d: &Vec<na::Vector3<f32>>, normalized_imag
 	// This is solved by building the linear system At = b, where t corresponds to the (unknown) translation.
 	// This is then inverted with the associated normal equations to give t = inv(transpose(A)*A)*transpose(A)*b
 	// For efficiency we only store the coefficients of (transpose(A)*A) and (transpose(A)*b)
-	let n = 3*object_points_2d.len();
 
 	// Coefficients of A.T * A 
 	let mut ata = na::Matrix3::new(
-		n as f32, 0.0, 0.0,
-		0f32, n as f32, 0f32,
+		4f32, 0.0, 0.0,
+		0f32, 4f32, 0f32,
 		0f32, 0f32, 0f32
 	);
 
@@ -338,7 +336,6 @@ fn compute_reprojection_error(pose: &MarkerPose, object_points_2d: &Vec<na::Vect
 mod tests {
 	use super::*;
 	use nalgebra as na;
-	use std::f32::consts::PI;
 	use rand::{rng, Rng};
 
 	#[test]
@@ -401,5 +398,118 @@ mod tests {
 		}
 		println!("Total Tests: {tests} \n Total Error: {total_error} \n Biggest Error: {max_error} \n Failures: {failures}");
 		assert_eq!(failures, 0);
+	}
+
+	#[test]
+	fn test_gen_marker_square() {
+		let square = make_marker_square(11.0f32);
+		assert_eq!(square[0].x, -5.5);
+		assert_eq!(square[0].y, 5.5);
+
+		assert_eq!(square[1].x, 5.5);
+		assert_eq!(square[1].y, 5.5);
+
+		assert_eq!(square[2].x, 5.5);
+		assert_eq!(square[2].y, -5.5);
+
+		assert_eq!(square[3].x, -5.5);
+		assert_eq!(square[3].y, -5.5);
+	}
+
+	#[test]
+	fn test_homography_solve() {
+		let marker_size = 11.0f32;
+		let square = make_marker_square(marker_size);
+		let target_points = vec![
+			na::Vector2::<f32>::new(0.1, 0.1),
+			na::Vector2::<f32>::new(0.3, 0.1),
+			na::Vector2::<f32>::new(0.3, 0.3),
+			na::Vector2::<f32>::new(0.1, 0.3),
+		];
+		let expected = na::Matrix3::new(
+			0.01818181818181819, 0.0, 0.2,
+			9.856383386231859e-19, -0.01818181818181819, 0.2000000000000001,
+			1.577021341797097e-17, -1.577021341797097e-17, 1.0
+		);
+		let computed_homography = compute_homography_from_marker_square(marker_size, &target_points);
+		assert!((computed_homography - expected).abs().sum() < 1e-5);
+	}
+
+	#[test]
+	fn test_canonical_solve() {
+		let marker_size = 11.0f32;
+		let square = make_marker_square(marker_size);
+		let target_points = vec![
+			na::Vector2::<f32>::new(0.1, 0.1),
+			na::Vector2::<f32>::new(0.3, 0.1),
+			na::Vector2::<f32>::new(0.3, 0.3),
+			na::Vector2::<f32>::new(0.1, 0.3),
+		];
+		let homography = compute_homography_from_marker_square(marker_size, &target_points);
+		let (pa, pb) = solve_canonical_form(&square, &target_points, &homography);
+		let expected_pose_a = na::Matrix4::new(
+			1.0, -2.775557561562891e-17, 1.02695629777827e-15, 10.99999999999999,
+			7.632783294297951e-17, -1.0, 1.02695629777827e-15, 11.0,
+			1.02695629777827e-15, -9.992007221626409e-16, -1.0, 54.99999999999996,
+			0.0, 0.0, 0.0, 1.0,
+		);
+		let expected_pose_b = na::Matrix4::new(
+			0.9259259259259256, 0.07407407407407443, -0.3703703703703712, 10.79629629629629,
+			-0.0740740740740744, -0.9259259259259256, -0.3703703703703713, 10.79629629629629,
+			-0.3703703703703712, 0.3703703703703713, -0.8518518518518512, 54.99999999999999,
+			0.0, 0.0, 0.0, 1.0,
+		);
+		let rot_a = expected_pose_a.view((0, 0), (3, 3));
+		let rot_b = expected_pose_b.view((0, 0), (3, 3));
+		let translation_a = na::Vector3::new(expected_pose_a[(0, 3)], expected_pose_a[(1, 3)], expected_pose_a[(2, 3)]);
+		let translation_b = na::Vector3::new(expected_pose_b[(0, 3)], expected_pose_b[(1, 3)], expected_pose_b[(2, 3)]);
+
+		println!("{}", &pa.translation);
+		println!("{}", &pb.translation);
+
+		assert!((pa.rotation - rot_a).abs().sum() < 1e-5);
+		assert!((pb.rotation - rot_b).abs().sum() < 1e-5);
+		assert!((pa.translation - translation_a).abs().sum() < 1e-4);
+		assert!((pb.translation - translation_b).abs().sum() < 1e-4);
+	}
+
+	#[test]
+	fn test_e2e_pose() {
+		let target_points = vec![
+			(90, 89),
+			(95, 150),
+			(80, 170),
+			(75, 90),
+		];
+		let (pa, pb) = solve_ippe_square((1000, 1000), &target_points, 17.0f32);
+		let pa_expected = MarkerPose {
+			translation: na::Vector3::new(20.32196265994096f32, 29.69316666108512f32, 238.3658341694123f32),
+			rotation: na::Matrix3::new(
+				0.07313995850727262, 0.2953796077825095, 0.9525762089070907,
+				0.9973210134149258, -0.02055233410014844, -0.07020254813082821,
+				-0.001158736630905738, 0.9551588814795613, -0.2960914866390682,
+			),
+			error: 0.0f32,
+		};
+		let pb_expected = MarkerPose {
+			translation: na::Vector3::new(19.85146615649354f32, 29.20013946746331f32, 234.3277337340188f32),
+			rotation: na::Matrix3::new(
+				0.05174977302896467, 0.1311239186581316, -0.9900143832021767,
+				0.9667844474723887, -0.2550432732960733, 0.01675592050389792,
+				-0.2502994069448807, -0.957997623536802, -0.1399669967559523,
+			),
+			error: 0.0f32,
+		};
+
+		let rot_mat_err_a = (pa.rotation - pa_expected.rotation).abs().sum();
+		let rot_mat_err_b = (pb.rotation - pb_expected.rotation).abs().sum();
+
+		let translation_err_a = (pa.translation - pa_expected.translation).abs().sum();
+		let translation_err_b = (pb.translation - pb_expected.translation).abs().sum();
+
+		assert!(rot_mat_err_a < 2e-5);
+		assert!(rot_mat_err_b < 2e-5);
+		assert!(translation_err_a < 0.0005f32);
+		assert!(translation_err_b < 0.0005f32);
 	}
 }
