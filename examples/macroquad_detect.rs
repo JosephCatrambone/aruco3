@@ -1,4 +1,4 @@
-use aruco3::{ARDictionary, Detection, Detector, DetectorConfig, estimate_pose};
+use aruco3::{ARDictionary, CameraIntrinsics, Detection, Detector, DetectorConfig, estimate_pose};
 use macroquad::prelude::*;
 use image as image_rs;
 use imageproc;
@@ -13,6 +13,7 @@ const CAMERA_FOV: f32 = 45.0f32.to_radians();
 #[macroquad::main("3D")]
 async fn main() {
 	//let rust_logo = load_texture("examples/rust.png").await.unwrap();
+	let camera_params = CameraIntrinsics::from_fov(CAMERA_FOV, 1.0f32, screen_width() as u32, screen_height() as u32);
 	let detector = Detector {
 		config: DetectorConfig {
 			..Default::default()
@@ -145,7 +146,7 @@ async fn main() {
 			for (a, b) in [(0usize, 1usize), (1, 2), (2, 3), (3, 0)] {
 				draw_line(m.corners[a].0 as f32, m.corners[a].1 as f32, m.corners[b].0 as f32, m.corners[b].1 as f32, 2.0f32, RED);
 			}
-			let (pose_best, pose_alt) = estimate_pose(last_detection.grey.clone().expect("Missing image in marker cap").dimensions(), &m.corners, MARKER_SIZE);
+			let (pose_best, pose_alt) = estimate_pose(last_detection.grey.clone().expect("Missing image in marker cap").dimensions(), &m.corners, MARKER_SIZE, Some(&camera_params));
 			// Swap Y and Z because our coordinate systems are different.
 			let estimated_position = vec3(pose_best.translation.x, pose_best.translation.z, pose_best.translation.y);
 			text = format!("Estimated: Camera Position: {}", estimated_position);

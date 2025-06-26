@@ -2,7 +2,7 @@
 A pure Rust implementation of Aruco and AprilTag detection/pose estimation.
 Ported from the excellent https://github.com/damianofalcioni/js-aruco2 library and using a lightly modified version of the IPPE algorithm as implemented in https://github.com/tobycollins/IPPE.
 
-Detection and quad estimation work well.  Pose estimation is broken, but I will continue to pour my rapidly dwindling sanity into it to find a solution.
+Detection and quad estimation work well in most cases.  Pose estimations are consistent with what the OpenCV solution reports, though we still need to handle lens distortion.
 
 See webcam_kamera or webcam_nokhwa for usage.
 
@@ -28,12 +28,10 @@ for d in detections.markers.iter() {
 ```rust
 /// Compute a pose.
 /// Takes in the marker points detected from a detection 'd' above.
-let mut pose_estimator = PoseEstimator::new((640, 480), 0.04f32, 0.01f32); // 40mm markers on a 640x480 image.
-pose_estimator.max_refinement_iterations = 100; // Lower = more noise but faster.
-
 for d in detections.markers.iter() {
     // Each detection has two physically plausible poses. They're sorted by expected accuracy.
-    let (pose1, _) = pose_estimator.estimate_marker_pose(&d.corners); 
+    // Also note: this does not undistort the corners of the image. That's not _strictly_ necessary, but...
+    let (pose_best, pose_alt) = estimate_pose((1920, 1080), &d.corners, MARKER_SIZE_IN_MM); 
     
     // Do something with the pose:
     let marker_points = vec![(0.0, 0.0, 0.0f32), (1.0f32, 0.0, 0.0), (0.0, 1.0f32, 0.0), (0.0, 0.0, 1.0f32)];

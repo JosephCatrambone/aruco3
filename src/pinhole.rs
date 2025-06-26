@@ -72,9 +72,16 @@ impl CameraIntrinsics {
 	}
 
 	/// Direct Linear Transform
+	/// Convert each projected point in the camera frustum to a normalized image point.
+	/// Input space: R^3 (with z!=0).
+	/// Output space: R^2 (0 - 1)
 	pub fn project(&self, x: f32, y:f32, z:f32) -> (f32, f32) {
-		((x * self.focal_x)/z + self.principal_x, (y * self.focal_y)/z + self.principal_y)
+		(
+			((x * self.focal_x)/z - self.principal_x) / self.image_width as f32,
+			((y * self.focal_y)/z - self.principal_y) / self.image_height as f32,
+		)
 	}
+	
 }
 
 impl CameraExtrinsics {

@@ -1,5 +1,6 @@
 use std::ops::{Add, Sub, Mul, Div};
 use nalgebra as na;
+use crate::CameraIntrinsics;
 
 #[derive(Clone, Debug)]
 pub struct MarkerPose {
@@ -42,8 +43,13 @@ impl Default for MarkerPose {
 	}
 }
 
-pub fn solve_ippe_square(image_size: (u32, u32), undistorted_points: &Vec<(u32, u32)>, marker_size_mm: f32) -> (MarkerPose, MarkerPose) {
-	let normalized_image_points = normalize_image_points(undistorted_points, image_size);
+// As a matter of usability, should we pack the intrinsics/image size/marker size into an object?
+pub fn solve_ippe_square(image_size: (u32, u32), image_points: &Vec<(u32, u32)>, marker_size_mm: f32, camera_intrinsics: Option<&CameraIntrinsics>) -> (MarkerPose, MarkerPose) {
+	let normalized_image_points = if let Some(intrinsitcs) = camera_intrinsics {
+		image_points.iter().map(|&(x, y)| { intrinsitcs.project(x as f32, y as f32, 1f32) }).map(|(x, y)| { na::Vector2::new(x, y) }).collect()
+	} else {
+		normalize_image_points(image_points, image_size)
+	};
 	let object_points_2d = make_marker_square(marker_size_mm);
 
 	// Compute the homography from the marker square to the image points.
@@ -481,7 +487,7 @@ mod tests {
 			(80, 170),
 			(75, 90),
 		];
-		let (pa, pb) = solve_ippe_square((1000, 1000), &target_points, 17.0f32);
+		let (pa, pb) = solve_ippe_square((1000, 1000), &target_points, 17.0f32, None);
 		let pa_expected = MarkerPose {
 			translation: na::Vector3::new(20.32196265994096f32, 29.69316666108512f32, 238.3658341694123f32),
 			rotation: na::Matrix3::new(
