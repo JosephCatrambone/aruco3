@@ -31,7 +31,7 @@ for d in detections.markers.iter() {
 for d in detections.markers.iter() {
     // Each detection has two physically plausible poses. They're sorted by expected accuracy.
     // Also note: this does not undistort the corners of the image. That's not _strictly_ necessary, but...
-    let (pose_best, pose_alt) = estimate_pose((1920, 1080), &d.corners, MARKER_SIZE_IN_MM); 
+    let (pose_best, pose_alt) = estimate_pose((1920, 1080), &d.corners, MARKER_SIZE_IN_MM, None /* camera intrinsice can be provided here */); 
     
     // Do something with the pose:
     let marker_points = vec![(0.0, 0.0, 0.0f32), (1.0f32, 0.0, 0.0), (0.0, 1.0f32, 0.0), (0.0, 0.0, 1.0f32)];

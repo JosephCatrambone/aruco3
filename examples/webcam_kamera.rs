@@ -1,5 +1,5 @@
 
-use aruco3::{ARDictionary, Detector, DetectorConfig, estimate_pose};
+use aruco3::{ARDictionary, Detector, DetectorConfig, pose};
 use imageproc;
 use image;
 use kamera::Camera;
@@ -65,7 +65,7 @@ fn main() {
 		// Compute pose:
 		let marker_points = vec![(0.0, 0.0, 0.0f32), (1.0f32, 0.0, 0.0), (0.0, 1.0f32, 0.0), (0.0, 0.0, 1.0f32)];
 		for d in detections.markers.iter() {
-			let (pose1, _) = estimate_pose((w, h), &d.corners, 10.0f32, None);
+			let (pose1, _) = pose::solve_with_undistorted_points(&d.corners, 10.0f32, (w, h));
 			let unproj_pts = pose1.apply_transform_to_points(&marker_points);
 			draw_axes(&unproj_pts, &mut window_buffer, w, h);
 		}

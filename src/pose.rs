@@ -43,37 +43,35 @@ impl Default for MarkerPose {
 	}
 }
 
+pub fn solve_with_intrinsics(image_points: &Vec<(u32, u32)>, marker_size_mm: f32, camera_intrinsics: &CameraIntrinsics) -> (MarkerPose, MarkerPose) {
+	let pts = image_points.iter().map(|&(x, y)| { camera_intrinsics.unproject(x as f32, y as f32) }).collect();
+	solve_with_normalized_points(&pts, marker_size_mm)
+}
+
 // As a matter of usability, should we pack the intrinsics/image size/marker size into an object?
-pub fn solve_ippe_square(image_size: (u32, u32), image_points: &Vec<(u32, u32)>, marker_size_mm: f32, camera_intrinsics: Option<&CameraIntrinsics>) -> (MarkerPose, MarkerPose) {
-	let normalized_image_points = if let Some(intrinsitcs) = camera_intrinsics {
-		image_points.iter().map(|&(x, y)| { intrinsitcs.project(x as f32, y as f32, 1f32) }).map(|(x, y)| { na::Vector2::new(x, y) }).collect()
-	} else {
-		normalize_image_points(image_points, image_size)
-	};
+/// This method assumes that points have been undistorted (or that you don't care) and are on the image plane from 0-width,0-height.
+pub fn solve_with_undistorted_points(image_points: &Vec<(u32, u32)>, marker_size_mm: f32, image_size: (u32, u32)) -> (MarkerPose, MarkerPose) {
+	let pts = image_points.iter().map(|&(x, y)| { ((x as f32) / image_size.0 as f32, (y as f32) / image_size.1 as f32) }).collect();
+	solve_with_normalized_points(&pts, marker_size_mm)
+}
+
+pub fn solve_with_normalized_points(normalized_image_points: &Vec<(f32, f32)>, marker_size_mm: f32) -> (MarkerPose, MarkerPose) {
 	let object_points_2d = make_marker_square(marker_size_mm);
+	let normalized_points: Vec<na::Vector2<f32>> = normalized_image_points.iter().map(|&(x, y)| { na::Vector2::new(x, y) }).collect();
 
 	// Compute the homography from the marker square to the image points.
 	// Homography Matrix: [[x1], [y1], [1]] = H * [[x2], [y2], [1]]
 	// Both our world coordinates and our undistorted coordinates have zeros for their last row
 	// canonical_object_points_to_normalized_points_homography == homography
-	let homography = compute_homography_from_marker_square(marker_size_mm, &normalized_image_points);
+	let homography = compute_homography_from_marker_square(marker_size_mm, &normalized_points);
 
-	let (pose1, pose2) = solve_canonical_form(&object_points_2d, &normalized_image_points, &homography);
+	let (pose1, pose2) = solve_canonical_form(&object_points_2d, &normalized_points, &homography);
 
 	if pose1.error < pose2.error {
 		(pose1, pose2)
 	} else {
 		(pose2, pose1)
 	}
-}
-
-/// Converts points from integer coordinates [0, width) and [0, height) to [0,1].
-fn normalize_image_points(undistorted_points: &Vec<(u32, u32)>, image_size: (u32, u32)) -> Vec<na::Vector2<f32>> {
-	undistorted_points.iter().map(|p| { na::Vector2::<f32>::new(p.0 as f32 / image_size.0 as f32, p.1 as f32 / image_size.1 as f32 ) }).collect()
-}
-
-fn unnormalize_points(points: &Vec<na::Vector2<f32>>, image_size: (u32, u32)) -> Vec<(u32, u32)> {
-	points.iter().map(|p| { ((p.x * image_size.0 as f32) as u32, (p.y * image_size.1 as f32) as u32) }).collect()
 }
 
 /// Generate four points, clockwise, starting from the top left, around the center with z=0.
@@ -102,6 +100,7 @@ fn compute_homography_from_marker_square(marker_size_mm: f32, target_points: &Ve
 
 	let half_width = marker_size_mm / 2.0;
 	let det_inv: f32 = -1.0f32 / (half_width * (p1x * p2y - p2x * p1y - p1x * p4y + p2x * p3y - p3x * p2y + p4x * p1y + p3x * p4y - p4x * p3y));
+
 	let homography = na::Matrix3::new(
 		det_inv * (p1x * p3x * p2y - p2x * p3x * p1y - p1x * p4x * p2y + p2x * p4x * p1y - p1x * p3x * p4y + p1x * p4x * p3y + p2x * p3x * p4y - p2x * p4x * p3y), // 0,0
 		det_inv * (p1x * p2x * p3y - p1x * p3x * p2y - p1x * p2x * p4y + p2x * p4x * p1y + p1x * p3x * p4y - p3x * p4x * p1y - p2x * p4x * p3y + p3x * p4x * p2y), // 0,1
@@ -109,7 +108,7 @@ fn compute_homography_from_marker_square(marker_size_mm: f32, target_points: &Ve
 		det_inv * (p1x * p2y * p3y - p2x * p1y * p3y - p1x * p2y * p4y + p2x * p1y * p4y - p3x * p1y * p4y + p4x * p1y * p3y + p3x * p2y * p4y - p4x * p2y * p3y), // 1,0
 		det_inv * (p2x * p1y * p3y - p3x * p1y * p2y - p1x * p2y * p4y + p4x * p1y * p2y + p1x * p3y * p4y - p4x * p1y * p3y - p2x * p3y * p4y + p3x * p2y * p4y), // 1,1
 		det_inv * half_width * (p1x * p2y * p3y - p3x * p1y * p2y - p2x * p1y * p4y + p4x * p1y * p2y - p1x * p3y * p4y + p3x * p1y * p4y + p2x * p3y * p4y - p4x * p2y * p3y), // 1,2
-		-det_inv * (p1x * p3y - p3x * p1y - p1x * p4y - p2x * p3y + p3x * p2y + p4x * p1y + p2x * p4y - p4x * p2y),
+		-det_inv * (p1x * p3y - p3x * p1y - p1x * p4y - p2x * p3y + p3x * p2y + p4x * p1y + p2x * p4y - p4x * p2y), // 2,0
 		det_inv * (p1x * p2y - p2x * p1y - p1x * p3y + p3x * p1y + p2x * p4y - p4x * p2y - p3x * p4y + p4x * p3y), // 2,1
 		1.0f32,
 	);
@@ -300,6 +299,8 @@ fn compute_translation(object_points_2d: &Vec<na::Vector3<f32>>, normalized_imag
 		atb2 += a2 * bx + b2 * by;
 	}
 
+	// println!("atb0, 1, 2: {} {} {}", &atb0, &atb1, &atb2);
+
 	let det_a_inv = 1.0 / (ata.m11 * ata.m22 * ata.m33 - ata.m11 * ata.m23 * ata.m32 - ata.m13 * ata.m22 * ata.m31);
 	//let det_a_inv = 1.0 / ata.determinant();
 
@@ -316,6 +317,8 @@ fn compute_translation(object_points_2d: &Vec<na::Vector3<f32>>, normalized_imag
 		-ata.m11 * ata.m32,
 		ata.m11 * ata.m22,
 	);
+
+	//println!("S00, 01, ...:\n{}, {}, {}\n{}, {}, {}\n{}, {}, {}", s.m11, s.m12, s.m13, s.m21, s.m22, s.m23, s.m31, s.m32, s.m33);
 
 	// Solve t:
 	na::Vector3::new(
@@ -343,6 +346,29 @@ mod tests {
 	use super::*;
 	use nalgebra as na;
 	use rand::{rng, Rng};
+
+	fn assert_approx_equal<'a, R, C, S>(
+		a: &'a na::Matrix<f32, R, C, S>,
+		b: &'a na::Matrix<f32, R, C, S>,
+		epsilon: f32,
+	) -> bool where
+		R: na::Dim,
+		C: na::Dim,
+		S: na::RawStorage<f32, R, C>,
+	{
+		let mut success = true;
+		let (rows, cols) = a.shape();
+		for r in 0..rows {
+			for c in 0..cols {
+				if (a[(r, c)] - b[(r, c)]).abs() > epsilon {
+					success = false;
+					eprintln!("|a-b| > epsilon at {},{}: {} {}", &r, &c, &a[(r,c)], &b[(r,c)]);
+				}
+			}
+		}
+		assert!(success);
+		success
+	}
 
 	#[test]
 	fn test_marker_transforms() {
@@ -487,7 +513,7 @@ mod tests {
 			(80, 170),
 			(75, 90),
 		];
-		let (pa, pb) = solve_ippe_square((1000, 1000), &target_points, 17.0f32, None);
+		let (pa, pb) = solve_with_undistorted_points(&target_points, 17.0f32, (1000, 1000));
 		let pa_expected = MarkerPose {
 			translation: na::Vector3::new(20.32196265994096f32, 29.69316666108512f32, 238.3658341694123f32),
 			rotation: na::Matrix3::new(
@@ -517,5 +543,51 @@ mod tests {
 		assert!(rot_mat_err_b < 2e-5);
 		assert!(translation_err_a < 0.0005f32);
 		assert!(translation_err_b < 0.0005f32);
+	}
+
+	#[test]
+	fn test_e2e_pose2() {
+		let marker_size = 19.0f32;
+		let points = vec![
+			(-0.090f32, -0.089f32),
+			(-0.095f32, -0.150f32),
+			(-0.080f32, -0.170f32),
+			(-0.075f32, -0.090f32),
+		];
+		let points_f32 = points.iter().map(|&(x,y)| { na::Vector2::new(x, y) }).collect();
+
+		let h = compute_homography_from_marker_square(marker_size, &points_f32);
+		let expected_homography = na::Matrix3::new(
+			0.0001197249881460392, -0.00193812233285917, -0.08585585585585585,
+			-0.003084400189663352, -0.00115457562825984, -0.1225675675675677,
+			-0.004504504504504568, 0.01351351351351346, 1.0,
+		);
+
+		assert_approx_equal(&h, &expected_homography, 1e-5); //(h - expected_homography).abs().sum() < 1e-5);
+
+		let (pa, pb) = solve_with_normalized_points(&points, marker_size);
+		let pa_expected = MarkerPose {
+			translation: na::Vector3::new( -22.712781796404,  -33.18648038591866, 266.408873483460),
+			rotation: na::Matrix3::new(
+				-0.07313995850727262, -0.2953796077825095, -0.9525762089070907,
+				-0.9973210134149258, 0.02055233410014844, 0.07020254813082821,
+				-0.001158736630905738, 0.9551588814795613, -0.2960914866390682,
+			),
+			error: 0.0f32,
+		};
+		let pb_expected = MarkerPose {
+			translation: na::Vector3::new( -22.18693276313984, -32.6354499930472,  261.8957024086092),
+			rotation: na::Matrix3::new(
+			-0.05174977302896467, -0.1311239186581316, 0.9900143832021767,
+			-0.9667844474723887, 0.2550432732960733, -0.01675592050389792,
+			-0.2502994069448807, -0.957997623536802, -0.1399669967559523,
+			),
+			error: 0.0f32,
+		};
+
+		assert_approx_equal(&pa.rotation, &pa_expected.rotation, 1e-5);
+		assert_approx_equal(&pb.rotation, &pb_expected.rotation, 1e-5);
+		assert_approx_equal(&pa.translation, &pa_expected.translation, 1e-3);
+		assert_approx_equal(&pb.translation, &pb_expected.translation, 1e-3);
 	}
 }

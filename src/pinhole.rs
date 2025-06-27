@@ -1,5 +1,6 @@
 
 use nalgebra as na;
+use nalgebra::Matrix4;
 
 pub struct CameraExtrinsics {
 	pub left: na::Vector3<f32>,
@@ -18,8 +19,8 @@ pub struct CameraIntrinsics {
 }
 
 pub struct CameraModel {
-	pub intrinsics: CameraIntrinsics,
-	pub extrinsics: CameraExtrinsics,
+	intrinsics: CameraIntrinsics,
+	extrinsics: CameraExtrinsics,
 }
 
 impl CameraIntrinsics {
@@ -49,7 +50,7 @@ impl CameraIntrinsics {
 		}
 	}
 
-	pub fn from_fov(horizontal_fov: f32, sensor_width_mm: f32, resolution_x: u32, resolution_y: u32) -> Self {
+	pub fn new_from_fov(horizontal_fov_radians: f32, sensor_width_mm: f32, resolution_x: u32, resolution_y: u32) -> Self {
 		// Horizontal FOV=Vertical FOV×Aspect Ratio
 		// vfov = hfov / aspect_ratio
 		let aspect_ratio = resolution_x as f32/resolution_y as f32;
@@ -59,8 +60,8 @@ impl CameraIntrinsics {
 		// hfov / 2 = arctan((sensor_width/2) / focal_len_mm)
 		// tan(hfov/2) = (sensor_width/2) / focal_len_mm
 		// tan(hfov/2) / (sensor_width/2) = 1/focal_len_mm
-		let horizontal_focal_length_mm = (sensor_width_mm*0.5f32) / (horizontal_fov*0.5f32).tan();
-		let vertical_focal_length_mm = ((sensor_width_mm / aspect_ratio)*0.5f32) / (horizontal_fov*0.5f32).tan();
+		let horizontal_focal_length_mm = (sensor_width_mm*0.5f32) / (horizontal_fov_radians * 0.5f32).tan();
+		let vertical_focal_length_mm = ((sensor_width_mm / aspect_ratio)*0.5f32) / (horizontal_fov_radians * 0.5f32).tan();
 		Self {
 			image_width: resolution_x,
 			image_height: resolution_y,
@@ -71,23 +72,50 @@ impl CameraIntrinsics {
 		}
 	}
 
-	/// Direct Linear Transform
-	/// Convert each projected point in the camera frustum to a normalized image point.
-	/// Input space: R^3 (with z!=0).
-	/// Output space: R^2 (0 - 1)
-	pub fn project(&self, x: f32, y:f32, z:f32) -> (f32, f32) {
+	/// If we have world coordinates, image plane coordinates, and camera coordinates, this goes from camera_coordinates (0-1) to image plane coordinates.
+	pub fn project(&self, x: f32, y:f32, z:f32) -> (f32, f32, f32) {
 		(
-			((x * self.focal_x)/z - self.principal_x) / self.image_width as f32,
-			((y * self.focal_y)/z - self.principal_y) / self.image_height as f32,
+			(x * self.focal_x) + (z * self.principal_x),
+			(y * self.focal_y) + (z * self.principal_y),
+			z,
 		)
 	}
-	
+
+	/// From image plane coordinates to camera space coordinates.
+	/// Assumes z=1.
+	pub fn unproject(&self, x: f32, y:f32) -> (f32, f32) {
+		(
+			(x - self.principal_x) / self.focal_x,
+			(y - self.principal_y) / self.focal_y,
+		)
+	}
+}
+
+/// This is the K matrix in the projection equation [u,v,1].T = K * [R | t] * [X, Y, Z, 1].T
+impl From<CameraIntrinsics> for na::Matrix3<f32> {
+	fn from(intrinsics: CameraIntrinsics) -> Self {
+		na::Matrix3::new(
+			intrinsics.focal_x, 0.0f32, intrinsics.principal_x,
+			0f32, intrinsics.focal_y, intrinsics.principal_y,
+			0f32, 0f32, 1f32,
+		)
+	}
+}
+
+impl From<CameraIntrinsics> for na::Matrix3x4<f32> {
+	fn from(intrinsics: CameraIntrinsics) -> Self {
+		na::Matrix3x4::new(
+			intrinsics.focal_x, 0.0f32, intrinsics.principal_x, 0f32,
+			0f32, intrinsics.focal_y, intrinsics.principal_y, 0f32,
+			0f32, 0f32, 1f32, 0f32,
+		)
+	}
 }
 
 impl CameraExtrinsics {
 	/// Given a coordinate system where -z is forward, +y is up, and +x is right, returns a set of camera extrinsics.
 	/// +z is backward.  -y is down.  -x is left.
-	pub fn from_lookat(eye_position: (f32, f32, f32), looking_at: (f32, f32, f32), world_up: (f32, f32, f32)) -> Self {
+	pub fn new_from_lookat(eye_position: (f32, f32, f32), looking_at: (f32, f32, f32), world_up: (f32, f32, f32)) -> Self {
 		/*
         # Eye is the camera position.  Lookat is the point upon which the camera is focusing.  Up is the global world-up.
         # -z is forward.  +y is up.  +x is right.
@@ -151,6 +179,17 @@ return partial
 */
 }
 
+impl From<CameraExtrinsics> for na::Matrix4<f32> {
+	fn from(extrinsics: CameraExtrinsics) -> Self {
+		na::Matrix4::new(
+			extrinsics.left.x, extrinsics.left.y, extrinsics.left.z, extrinsics.position.x,
+			extrinsics.up.x, extrinsics.up.y, extrinsics.up.z, extrinsics.position.y,
+			extrinsics.forward.x, extrinsics.forward.y, extrinsics.forward.z, extrinsics.position.z,
+			0f32, 0f32, 0f32, 1f32,
+		)
+	}
+}
+
 impl CameraModel {
 	/// Given a point in 3D space, project to a fractional screen coordinate IF IN FRONT.
 	pub fn project_point(&self, x: f32, y: f32, z: f32) -> Option<(f32, f32)> {
@@ -170,8 +209,8 @@ impl CameraModel {
 			return points
 		*/
 		let (x2, y2, z2) = self.extrinsics.project(x, y, z);
-		let (x3, y3) = self.intrinsics.project(x2, y2, z2);
-		Some((x3, y3))
+		let (x3, y3, z3) = self.intrinsics.project(x2, y2, z2);
+		Some((x3/z3, y3/z3))
 		// sensor sys = image plane to sensor mat * camera to image mat * obj to camera mat * obj system homo
 	}
 }
@@ -194,13 +233,19 @@ mod tests {
 	}
 
 	#[test]
+	fn test_unproject_intrinsics() {
+		let intr = CameraIntrinsics::new(640, 480, 1.0f32, 1.0f32, None, None);
+
+	}
+
+	#[test]
 	fn test_project() {
 		let intr = CameraIntrinsics::new(640, 480, 1.0f32, 1.0f32, None, None);
-		let mut extr = CameraExtrinsics::from_lookat((0f32, 0f32, -10f32), (0f32, 0f32, 0f32), (0f32, 1f32, 0f32));
+		let mut extr = CameraExtrinsics::new_from_lookat((0f32, 0f32, -10f32), (0f32, 0f32, 0f32), (0f32, 1f32, 0f32));
 		let mut c = CameraModel { extrinsics: extr, intrinsics: intr };
-		let proj = c.project_point(0f32, 0f32, 0f32); // We expect if the camera is moved back by 10 units it should still be centered.
-		assert!(proj.is_some());
-		assert_eq!(proj.unwrap(), (320f32, 240f32));
+		let image_point = c.project_point(0f32, 0f32, 0f32); // We expect if the camera is moved back by 10 units it should still be centered.
+		assert!(image_point.is_some());
+		assert_eq!(image_point, Some((320f32, 240f32))); // Center of the focal plane.
 	}
 }
 

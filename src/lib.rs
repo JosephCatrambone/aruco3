@@ -1,12 +1,12 @@
 mod aruco;
 mod dictionaries;
-mod pose;
+pub mod pose;
 mod pinhole;
 
 pub use aruco::{Detector, DetectorConfig, Detection, Marker};
 pub use dictionaries::ARDictionary;
 pub use pinhole::{CameraIntrinsics};
-pub use pose::{MarkerPose, solve_ippe_square as estimate_pose};
+pub use pose::MarkerPose;
 
 pub(crate) fn hamming_distance(a: u64, b: u64) -> u8 {
 	let mut flipped_bits = a ^ b;

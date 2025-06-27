@@ -1,4 +1,4 @@
-use aruco3::{ARDictionary, CameraIntrinsics, Detection, Detector, DetectorConfig, estimate_pose};
+use aruco3::{ARDictionary, CameraIntrinsics, Detection, Detector, DetectorConfig, pose};
 use macroquad::prelude::*;
 use image as image_rs;
 use imageproc;
@@ -8,12 +8,13 @@ const MOVE_SPEED: f32 = 0.1;
 const MARKER_IMAGE_SIZE: u16 = 512;
 const MARKER_ID: usize = 69;
 const MARKER_SIZE: f32 = 0.10f32;
-const CAMERA_FOV: f32 = 45.0f32.to_radians();
+const CAMERA_HORIZONTAL_FOV_DEGREES: f32 = 45.0f32;
 
 #[macroquad::main("3D")]
 async fn main() {
 	//let rust_logo = load_texture("examples/rust.png").await.unwrap();
-	let camera_params = CameraIntrinsics::from_fov(CAMERA_FOV, 1.0f32, screen_width() as u32, screen_height() as u32);
+	//let camera_params = CameraIntrinsics::new_from_fov(CAMERA_HORIZONTAL_FOV_DEGREES.to_radians(), 1.0f32, screen_width() as u32, screen_height() as u32);
+	let camera_params = CameraIntrinsics::new(screen_width() as u32, screen_height() as u32, 1.0f32, 1.0f32, None, None);
 	let detector = Detector {
 		config: DetectorConfig {
 			..Default::default()
@@ -108,7 +109,7 @@ async fn main() {
 			position: camera_position,
 			up: up,
 			target: forward,
-			fovy: CAMERA_FOV * (screen_height()/screen_width()),
+			fovy: CAMERA_HORIZONTAL_FOV_DEGREES.to_radians() * (screen_height()/screen_width()),
 			//render_target: Some(render_target.clone()), // NOTE: We may be capturing this upside down!
 			..Default::default()
 		};
@@ -141,24 +142,28 @@ async fn main() {
 		let cam_pos = camera.position;
 		let mut text = format!("Ground Truth: Camera Position: {cam_pos}");
 		draw_text(&text, 10.0, 20.0, 12.0, BLACK);
+		let image_wh = if let Some(g) = (&last_detection).grey.clone() {
+			g.dimensions()
+		} else {
+			(0, 0)
+		};
 		for m in last_detection.markers.iter() {
 			draw_text(format!("ID: {}", m.id).as_str(), m.corners[0].0 as f32, m.corners[0].1 as f32, 12.0, RED);
 			for (a, b) in [(0usize, 1usize), (1, 2), (2, 3), (3, 0)] {
 				draw_line(m.corners[a].0 as f32, m.corners[a].1 as f32, m.corners[b].0 as f32, m.corners[b].1 as f32, 2.0f32, RED);
 			}
-			let (pose_best, pose_alt) = estimate_pose(last_detection.grey.clone().expect("Missing image in marker cap").dimensions(), &m.corners, MARKER_SIZE, Some(&camera_params));
+			let (pose_best, pose_alt) = pose::solve_with_intrinsics(&m.corners, MARKER_SIZE, &camera_params);
+			//let (pose_best, pose_alt) = pose::solve_with_undistorted_points(&m.corners, MARKER_SIZE, image_wh);
 			// Swap Y and Z because our coordinate systems are different.
-			let estimated_position = vec3(pose_best.translation.x, pose_best.translation.z, pose_best.translation.y);
+			let estimated_position = vec3(pose_best.translation.x, pose_best.translation.y, pose_best.translation.z);
 			text = format!("Estimated: Camera Position: {}", estimated_position);
 			draw_text(&text, 10.0, 30.0, 12.0, BLACK);
 
-			text = format!("Estimated: Alt Camera Position: {}, {}, {}", pose_alt.translation.x, pose_alt.translation.z, pose_alt.translation.y);
+			text = format!("Estimated: Alt Camera Position: {}, {}, {}", pose_alt.translation.x, pose_alt.translation.y, pose_alt.translation.z);
 			draw_text(&text, 10.0, 40.0, 12.0, BLACK);
 
 			text = format!("Error: Position: {}", estimated_position.distance(cam_pos));
 			draw_text(&text, 10.0, 50.0, 12.0, BLACK);
-
-			draw_sphere_wires(estimated_position, 1.0f32, None, PINK);
 		}
 
 		next_frame().await

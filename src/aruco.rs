@@ -348,6 +348,7 @@ mod tests {
 	use crate::dictionaries::ARDictionary;
 	use super::*;
 
+	#[ignore = "Long running test"] // Run with `cargo test -- --skip test_find_marker
 	#[test]
 	fn test_find_marker() {
 		let font: FontRef = FontRef::try_from_slice(include_bytes!("../assets/DejaVuSans.ttf")).expect("Couldn't load packed font.");
