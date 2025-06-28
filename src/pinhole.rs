@@ -1,7 +1,7 @@
 
 use nalgebra as na;
-use nalgebra::Matrix4;
 
+#[derive(Clone, Debug)]
 pub struct CameraExtrinsics {
 	pub left: na::Vector3<f32>,
 	pub up: na::Vector3<f32>,
@@ -9,6 +9,7 @@ pub struct CameraExtrinsics {
 	pub position: na::Vector3<f32>,
 }
 
+#[derive(Clone, Debug)]
 pub struct CameraIntrinsics {
 	pub image_width: u32,
 	pub image_height: u32,
@@ -19,26 +20,11 @@ pub struct CameraIntrinsics {
 }
 
 pub struct CameraModel {
-	intrinsics: CameraIntrinsics,
-	extrinsics: CameraExtrinsics,
+	pub intrinsics: CameraIntrinsics,
+	pub extrinsics: CameraExtrinsics,
 }
 
 impl CameraIntrinsics {
-	/*
-	@classmethod
-    def from_fov(cls, fov: float, resolution_x: int, resolution_y: int):
-        aspect_ratio = resolution_x/resolution_y
-        return cls(focal_x=aspect_ratio*math.tan(fov))
-
-    def set_sensor_width(self, width_mm: float):
-        self.focal_x = width_mm / self.image_width
-
-    def set_sensor_height(self, height_mm: float):
-        self.focal_y = height_mm / self.image_height
-
-    def to_matrix(self):
-        return numpy.array([[self.focal_x, 0, self.image_width/2.0], [0.0, self.focal_y, self.image_height/2.0], [0.0, 0.0, 1.0]])
-	*/
 	pub fn new(image_width: u32, image_height: u32, focal_x: f32, focal_y: f32, principal_x: Option<f32>, principal_y: Option<f32>) -> Self {
 		Self {
 			image_width,
@@ -50,18 +36,21 @@ impl CameraIntrinsics {
 		}
 	}
 
-	pub fn new_from_fov(horizontal_fov_radians: f32, sensor_width_mm: f32, resolution_x: u32, resolution_y: u32) -> Self {
+	pub fn new_from_fov_horizontal(horizontal_fov_radians: f32, sensor_width_mm: f32, resolution_x: u32, resolution_y: u32) -> Self {
 		// Horizontal FOV=Vertical FOV×Aspect Ratio
 		// vfov = hfov / aspect_ratio
 		let aspect_ratio = resolution_x as f32/resolution_y as f32;
+		let vertical_fov_radians = horizontal_fov_radians / aspect_ratio;
+		let sensor_height_mm = sensor_width_mm / aspect_ratio;
 
-		//Field angle of view = 2 x arctan ((sensor dimension (mm) / 2) / focal length (mm))
+		// Focal length = sensor width / (2*tan(FOV/2))
+		// Field angle of view = 2 x arctan ((sensor dimension (mm) / 2) / focal length (mm))
 		// hfov = 2*arctan((sensor_width/2) / focal_len_mm)
 		// hfov / 2 = arctan((sensor_width/2) / focal_len_mm)
 		// tan(hfov/2) = (sensor_width/2) / focal_len_mm
 		// tan(hfov/2) / (sensor_width/2) = 1/focal_len_mm
 		let horizontal_focal_length_mm = (sensor_width_mm*0.5f32) / (horizontal_fov_radians * 0.5f32).tan();
-		let vertical_focal_length_mm = ((sensor_width_mm / aspect_ratio)*0.5f32) / (horizontal_fov_radians * 0.5f32).tan();
+		let vertical_focal_length_mm = (sensor_height_mm*0.5f32) / (vertical_fov_radians * 0.5f32).tan();
 		Self {
 			image_width: resolution_x,
 			image_height: resolution_y,
@@ -72,13 +61,28 @@ impl CameraIntrinsics {
 		}
 	}
 
-	/// If we have world coordinates, image plane coordinates, and camera coordinates, this goes from camera_coordinates (0-1) to image plane coordinates.
+	/// Transform an object from camera coordinates (camera space) to image/homogeneous coordinates (view space).
+	/// In OpenGL this would be the projection matrix, which takes points in the frustum (-1.0 to +1.0) and maps them to (0 - image size).
+	/// A point at (0, 0, z) in the camera space would be at the image center after this.
 	pub fn project(&self, x: f32, y:f32, z:f32) -> (f32, f32, f32) {
 		(
 			(x * self.focal_x) + (z * self.principal_x),
 			(y * self.focal_y) + (z * self.principal_y),
 			z,
 		)
+	}
+
+	/// Transforms an object from camera coordinates/camera space/frustum to image/homogeneous coordinates (view space).
+	/// The input is a point from -1 to 1.0 on each axis (or, really, outside of that if you're wonky) and the output is from 0-image size.
+	/// Unlike project, this will clip the point if it's outside the normal viewing space (i.e., z <= 0.0).
+	pub fn project_culled(&self, x: f32, y:f32, z:f32) -> Option<(f32, f32)> {
+		if z <= 0.0f32 { // x < -1.0f32 || y < -1.0f32 || z <= 0.0f32 || x > 1.0f32 || y > 1.0f32 {
+			return None;
+		}
+		Some((
+			(x * self.focal_x)/z + self.principal_x,
+			(y * self.focal_y)/z + self.principal_y,
+		))
 	}
 
 	/// From image plane coordinates to camera space coordinates.
@@ -116,22 +120,6 @@ impl CameraExtrinsics {
 	/// Given a coordinate system where -z is forward, +y is up, and +x is right, returns a set of camera extrinsics.
 	/// +z is backward.  -y is down.  -x is left.
 	pub fn new_from_lookat(eye_position: (f32, f32, f32), looking_at: (f32, f32, f32), world_up: (f32, f32, f32)) -> Self {
-		/*
-        # Eye is the camera position.  Lookat is the point upon which the camera is focusing.  Up is the global world-up.
-        # -z is forward.  +y is up.  +x is right.
-        # +z is backward.  -y is down.  -x is left.
-        rev_camera_direction = numpy.array(eye) - numpy.array(lookat)
-        norm_rev_camera_direction = normalize(rev_camera_direction)
-        camera_right = normalize(numpy.cross(up, norm_rev_camera_direction))  # Represents +x in camera space.
-        camera_up = numpy.cross(norm_rev_camera_direction, camera_right)
-        return cls(left=-camera_right, up=camera_up, forward=norm_rev_camera_direction, camera_position=rev_camera_direction)
-        """
-        eye = numpy.array(eye)
-        forward = normalize(numpy.array(lookat) - eye)
-        left = numpy.cross(forward, normalize(up))
-        camera_up = numpy.cross(left, forward)
-        return cls(left=left, up=camera_up, forward=forward, camera_position=eye)
-		*/
 		let mut camera_up = na::Vector3::new(world_up.0, world_up.1, world_up.2).normalize();
 		let eye = na::Vector3::new(eye_position.0, eye_position.1, eye_position.2);
 		let lookat = na::Vector3::new(looking_at.0, looking_at.1, looking_at.2);
@@ -145,38 +133,36 @@ impl CameraExtrinsics {
 			position: eye,
 		}
 	}
+	
+	pub fn new_from_matrices(rotation: na::Matrix3<f32>, translation: na::Vector3<f32>) -> Self {
+		CameraExtrinsics {
+			left: na::Vector3::new(rotation.m11, rotation.m12, rotation.m13),
+			up: na::Vector3::new(rotation.m21, rotation.m22, rotation.m23),
+			forward: na::Vector3::new(rotation.m31, rotation.m32, rotation.m33),
+			position: translation,
+		}
+	}
 
 	pub fn project(&self, x: f32, y: f32, z: f32) -> (f32, f32, f32) {
 		// rx, ux, dx, tx | x
 		// ry, uy, dy, ty | y
 		// rz, uz, dz, tz | z
-		// P(3x4) = K(3x3) [ R -Rx_0 ]
-		let xp = (self.left.x * x + self.up.x * y - self.forward.x*z) - self.position.x;
-		let yp = (self.left.y * x + self.up.y * y - self.forward.y*z) - self.position.y;
-		let zp = (self.left.z * x + self.up.z * y - self.forward.z*z) - self.position.z;
+		let xp = (self.left.x * x + self.up.x * y + self.forward.x*z) + self.position.x;
+		let yp = (self.left.y * x + self.up.y * y + self.forward.y*z) + self.position.y;
+		let zp = (self.left.z * x + self.up.z * y + self.forward.z*z) + self.position.z;
 		(xp, yp, zp)
 	}
+}
 
-	/*
-def to_matrix(self):
-"""
-right = -self.left
-direction = self.forward
-basis_partial = numpy.eye(4)
-basis_partial[0,0:3] = right
-basis_partial[1,0:3] = self.up
-basis_partial[2,0:3] = direction
-translation_partial = numpy.eye(4)
-translation_partial[0:3,-1] = -self.camera_position
-return basis_partial @ translation_partial
-"""
-partial = numpy.eye(4)
-partial[0, 0:3] = self.left
-partial[1, 0:3] = self.up
-partial[2, 0:3] = -self.forward
-partial[0:3, -1] = -self.camera_position
-return partial
-*/
+impl Default for CameraExtrinsics {
+	fn default() -> Self {
+		CameraExtrinsics {
+			left: na::Vector3::new(1.0f32, 0.0f32, 0.0f32),
+			up: na::Vector3::new(0.0f32, 1.0f32, 0.0f32),
+			forward: na::Vector3::new(0.0f32, 0.0f32, 1.0f32),
+			position: na::Vector3::new(0f32, 0f32, 0f32)
+		}
+	}
 }
 
 impl From<CameraExtrinsics> for na::Matrix4<f32> {
@@ -193,25 +179,8 @@ impl From<CameraExtrinsics> for na::Matrix4<f32> {
 impl CameraModel {
 	/// Given a point in 3D space, project to a fractional screen coordinate IF IN FRONT.
 	pub fn project_point(&self, x: f32, y: f32, z: f32) -> Option<(f32, f32)> {
-		/*
-		class CameraModel:
-		intrinsics: CameraIntrinsics
-		extrinsics: CameraExtrinsics
-
-		def transform_points(self, points):
-			# Given a matrix of nx3, transform the points in accordance with the intrinsics and extrinsics.
-			assert points.shape[1] == 3
-			points = numpy.hstack((points, numpy.ones((points.shape[0], 1), dtype=points.dtype)))
-			points = points @ self.extrinsics.to_matrix().T  # nx4
-			points = points[:, 0:3] / points[:, 3:]  # nx3
-			points = points @ self.intrinsics.to_matrix().T # nx3
-			points = points[:, 0:2] / points[:, 2:] # nx2
-			return points
-		*/
 		let (x2, y2, z2) = self.extrinsics.project(x, y, z);
-		let (x3, y3, z3) = self.intrinsics.project(x2, y2, z2);
-		Some((x3/z3, y3/z3))
-		// sensor sys = image plane to sensor mat * camera to image mat * obj to camera mat * obj system homo
+		self.intrinsics.project_culled(x2, y2, z2)
 	}
 }
 

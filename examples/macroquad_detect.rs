@@ -13,8 +13,8 @@ const CAMERA_HORIZONTAL_FOV_DEGREES: f32 = 45.0f32;
 #[macroquad::main("3D")]
 async fn main() {
 	//let rust_logo = load_texture("examples/rust.png").await.unwrap();
-	//let camera_params = CameraIntrinsics::new_from_fov(CAMERA_HORIZONTAL_FOV_DEGREES.to_radians(), 1.0f32, screen_width() as u32, screen_height() as u32);
-	let camera_params = CameraIntrinsics::new(screen_width() as u32, screen_height() as u32, 1.0f32, 1.0f32, None, None);
+	let camera_params = CameraIntrinsics::new_from_fov_horizontal(CAMERA_HORIZONTAL_FOV_DEGREES.to_radians(), 10.0f32, screen_width() as u32, screen_height() as u32);
+	//let camera_params = CameraIntrinsics::new(screen_width() as u32, screen_height() as u32, 1.0f32, 1.0f32, None, None);
 	let detector = Detector {
 		config: DetectorConfig {
 			..Default::default()
@@ -51,7 +51,7 @@ async fn main() {
 	let WORLD_UP = vec3(0.0, 1.0, 0.0);
 	let mut mouse_grabbed = false;
 	let mut last_mouse_position: Vec2 = mouse_position().into();
-	let mut camera_position: Vec3 = vec3(0.0f32, 0.0f32, 0.0f32);
+	let mut camera_position: Vec3 = vec3(0.0f32, 1.0f32, 0.0f32);
 	let mut camera_rot_x = 0.0f32;
 	let mut camera_rot_z = 0.0f32;
 
@@ -142,18 +142,12 @@ async fn main() {
 		let cam_pos = camera.position;
 		let mut text = format!("Ground Truth: Camera Position: {cam_pos}");
 		draw_text(&text, 10.0, 20.0, 12.0, BLACK);
-		let image_wh = if let Some(g) = (&last_detection).grey.clone() {
-			g.dimensions()
-		} else {
-			(0, 0)
-		};
 		for m in last_detection.markers.iter() {
 			draw_text(format!("ID: {}", m.id).as_str(), m.corners[0].0 as f32, m.corners[0].1 as f32, 12.0, RED);
 			for (a, b) in [(0usize, 1usize), (1, 2), (2, 3), (3, 0)] {
 				draw_line(m.corners[a].0 as f32, m.corners[a].1 as f32, m.corners[b].0 as f32, m.corners[b].1 as f32, 2.0f32, RED);
 			}
 			let (pose_best, pose_alt) = pose::solve_with_intrinsics(&m.corners, MARKER_SIZE, &camera_params);
-			//let (pose_best, pose_alt) = pose::solve_with_undistorted_points(&m.corners, MARKER_SIZE, image_wh);
 			// Swap Y and Z because our coordinate systems are different.
 			let estimated_position = vec3(pose_best.translation.x, pose_best.translation.y, pose_best.translation.z);
 			text = format!("Estimated: Camera Position: {}", estimated_position);
