@@ -5,7 +5,7 @@ mod pinhole;
 
 pub use aruco::{Detector, DetectorConfig, Detection, Marker};
 pub use dictionaries::ARDictionary;
-pub use pinhole::{CameraIntrinsics, CameraExtrinsics, CameraModel};
+pub use pinhole::CameraIntrinsics;
 pub use pose::MarkerPose;
 
 pub(crate) fn hamming_distance(a: u64, b: u64) -> u8 {

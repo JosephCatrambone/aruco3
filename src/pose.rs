@@ -2,6 +2,8 @@ use std::ops::{Add, Sub, Mul, Div};
 use nalgebra as na;
 use crate::CameraIntrinsics;
 
+/// MarkerPose contains a translation and rotation that moves a fiducial directly in front of the camera away and into some place+orientation in the scene.
+/// It uses OpenCV's chirality: right-handed with +Z forward, +Y Down, and +X right.
 #[derive(Clone, Debug)]
 pub struct MarkerPose {
 	pub error: f32,
@@ -10,11 +12,15 @@ pub struct MarkerPose {
 }
 
 impl MarkerPose {
+	/// Translate an array of points such that if they were immediately in front of the camera, they would now be somewhere in the scene.
+	/// Uses a right-hand (+Z forward, +Y down, +X right) coordinate system.
 	pub fn apply_transform_to_points(&self, points: &Vec<(f32, f32, f32)>) -> Vec<(f32, f32, f32)> {
 		let as_vec3 = points.iter().map(|p| { na::Vector3::new(p.0, p.1, p.2) }).collect();
 		self.apply_transform_to_vectors(&as_vec3).into_iter().map(|p| {(p.x, p.y, p.z)}).collect()
 	}
 
+	/// Translate an array of vectors such that if they were immediately in front of the camera, they would now be somewhere in the scene.
+	/// Uses a right-hand (+Z forward, +Y down, +X right) coordinate system.
 	pub fn apply_transform_to_vectors(&self, points: &Vec<na::Vector3<f32>>) -> Vec<na::Vector3<f32>> {
 		points.iter().map(|p| {
 			(self.rotation * p) + self.translation

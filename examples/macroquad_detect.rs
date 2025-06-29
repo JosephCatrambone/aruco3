@@ -148,6 +148,7 @@ async fn main() {
 				draw_line(m.corners[a].0 as f32, m.corners[a].1 as f32, m.corners[b].0 as f32, m.corners[b].1 as f32, 2.0f32, RED);
 			}
 			let (pose_best, pose_alt) = pose::solve_with_intrinsics(&m.corners, MARKER_SIZE, &camera_params);
+			//let (pose_best, pose_alt) = pose::solve_with_normalized_points(&m.corners.iter().map(|&(x, y)| { (x as f32, y as f32 ) }).collect(), MARKER_SIZE);
 			// Swap Y and Z because our coordinate systems are different.
 			let estimated_position = vec3(pose_best.translation.x, pose_best.translation.y, pose_best.translation.z);
 			text = format!("Estimated: Camera Position: {}", estimated_position);
